@@ -473,7 +473,7 @@ struct GuiWorkerState {
 struct MonitorWindowApp {
     state: Arc<GuiWorkerState>,
     config: AppConfig,
-    /// When > 0, fits the window tightly to the rendered content on the next couple layout passes
+    initialized_style: bool,
     fit_passes_remaining: u8,
     last_fitted_size: Vec2,
 }
@@ -500,17 +500,18 @@ impl MonitorWindowApp {
         Self {
             state,
             config,
-            fit_passes_remaining: 3,
+            initialized_style: false,
+            fit_passes_remaining: 4,
             last_fitted_size: Vec2::ZERO,
         }
     }
 
     fn trigger_auto_fit(&mut self) {
-        self.fit_passes_remaining = 3;
+        self.fit_passes_remaining = 4;
+        self.last_fitted_size = Vec2::ZERO;
     }
 }
 
-/// Loads available system TTF fonts (Sans, Mono, Serif) so the user can switch families live.
 fn setup_system_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
 
@@ -559,7 +560,6 @@ fn setup_system_fonts(ctx: &egui::Context) {
             .insert("sys_serif".to_owned(), FontData::from_owned(bytes));
         serif_list.push("sys_serif".to_owned());
     }
-    // Fallback to proportional if no serif TTF is installed
     if let Some(prop) = fonts.families.get(&FontFamily::Proportional) {
         serif_list.extend(prop.iter().cloned());
     }
@@ -591,8 +591,24 @@ fn apply_font_style(ctx: &egui::Context, choice: FontChoice, base_size: f32) {
     ctx.set_style(style);
 }
 
+fn measure_text_width(ctx: &egui::Context, text: &str, choice: FontChoice, size: f32) -> f32 {
+    let font_id = FontId::new(size, choice.to_egui_family());
+    ctx.fonts(|f| {
+        f.layout_no_wrap(text.to_owned(), font_id, Color32::WHITE)
+            .size()
+            .x
+    })
+}
+
 impl eframe::App for MonitorWindowApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.initialized_style {
+            self.initialized_style = true;
+            apply_font_style(ctx, self.config.font_choice, self.config.font_size);
+            self.trigger_auto_fit();
+            ctx.request_repaint();
+        }
+
         let snap = self
             .state
             .snapshot
@@ -603,18 +619,20 @@ impl eframe::App for MonitorWindowApp {
         let mut cur_interval = self.state.interval_ms.load(Ordering::Relaxed);
         let mut config_dirty = false;
         let mut layout_changed = false;
+        let bar_height = self.config.font_size + 6.0;
 
         let top_resp = egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+            // `ui.min_rect().width()` measures the true intrinsic width of the horizontal widgets,
+            // never the full viewport width!
             ui.horizontal(|ui| {
                 ui.heading(RichText::new("KDE Monitor").strong());
 
                 ui.separator();
 
-                // Font Family selector
                 let prev_font = self.config.font_choice;
                 egui::ComboBox::from_id_salt("font_family_combo")
                     .selected_text(self.config.font_choice.label())
-                    .width(56.0)
+                    .width(56.0 * (self.config.font_size / 13.0))
                     .show_ui(ui, |ui| {
                         for choice in FontChoice::ALL {
                             ui.selectable_value(
@@ -630,7 +648,6 @@ impl eframe::App for MonitorWindowApp {
                     layout_changed = true;
                 }
 
-                // Font Size [-] [13] [+] controls
                 if ui
                     .small_button("−")
                     .on_hover_text("Decrease font size")
@@ -655,10 +672,9 @@ impl eframe::App for MonitorWindowApp {
 
                 ui.separator();
 
-                // Refresh interval selector
                 egui::ComboBox::from_id_salt("poll_rate_combo")
                     .selected_text(format!("{:.1}s", cur_interval as f32 / 1000.0))
-                    .width(52.0)
+                    .width(52.0 * (self.config.font_size / 13.0))
                     .show_ui(ui, |ui| {
                         for &ms in &POLL_INTERVALS_MS {
                             let label = format!("{:.1}s", ms as f32 / 1000.0);
@@ -685,7 +701,7 @@ impl eframe::App for MonitorWindowApp {
 
                 if ui
                     .small_button("Fit")
-                    .on_hover_text("Shrink window to fit content")
+                    .on_hover_text("Fit window to content")
                     .clicked()
                 {
                     layout_changed = true;
@@ -694,226 +710,287 @@ impl eframe::App for MonitorWindowApp {
                 if ui.button("Hide").clicked() {
                     ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
+
+                ui.min_rect().width()
             })
-            .response
+            .inner
         });
 
-        let top_bar_req_w = top_resp.inner.rect.width();
+        let top_bar_intrinsic_w = top_resp.inner;
         let top_bar_h = top_resp.response.rect.height();
 
-        let mut content_size = Vec2::ZERO;
+        // Compute deterministic intrinsic width from text glyphs and per-core grid—
+        // completely independent of the current viewport width so shrinking font shrinks the window cleanly.
+        let sample_strings = [
+            "Data: 99.9G → Compr: 99.9G | RAM: 99.9G / 99.9G",
+            "RAM: 99.99 / 99.99 GiB (100.0%)  ",
+            "Clock Load: 100%  (2500 / 2500 MHz)  ",
+            "Unified Memory (Shared RAM @ 8533 MT/s)",
+        ];
+        let max_line_w = sample_strings
+            .iter()
+            .map(|s| measure_text_width(ctx, s, self.config.font_choice, self.config.font_size))
+            .fold(0.0f32, f32::max);
+
+        let scale = self.config.font_size / 13.0;
+        let mono_boost = if self.config.font_choice == FontChoice::Mono {
+            1.12
+        } else {
+            1.0
+        };
+        let cols: usize = if snap.cpu_cores_mhz.is_empty() { 4 } else { 3 };
+        let cell_w = if snap.cpu_cores_mhz.is_empty() {
+            90.0 * scale * mono_boost
+        } else {
+            132.0 * scale * mono_boost
+        };
+
+        let grid_w = if self.config.show_per_core && !snap.cpu_cores_pct.is_empty() {
+            (cell_w * cols as f32) + (6.0 * (cols.saturating_sub(1) as f32))
+        } else {
+            0.0
+        };
+
+        // Group frame adds ~12px horizontal padding; TopBottomPanel adds ~16px window margins
+        let group_pad = 14.0;
+        let intrinsic_bar_w = max_line_w.max(grid_w).max(top_bar_intrinsic_w - group_pad);
+
+        let mut content_height = 0.0f32;
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Measure exact natural size of the stacked metric cards without expanding
-            let inner = ui.vertical(|ui| {
-                // --- CPU SECTION ---
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("CPU").strong());
-                        ui.label(
-                            RichText::new(format!("{:.1} °C", snap.cpu_temp_c))
-                                .color(Color32::from_rgb(0, 188, 212)),
-                        );
-                        if snap.cpu_avg_mhz > 0 {
-                            ui.label(
-                                RichText::new(format!("• Avg: {}", format_mhz(snap.cpu_avg_mhz)))
-                                    .color(Color32::from_rgb(128, 222, 234)),
-                            );
-                        }
-                        if ui
-                            .checkbox(&mut self.config.show_per_core, "Per-Core")
-                            .changed()
-                        {
-                            config_dirty = true;
-                            layout_changed = true;
-                        }
-                    });
+            // During auto-fit passes, pin bar width to `intrinsic_bar_w` so shrinking font shrinks width;
+            // once settled, let bars stretch if the user manually drags the window wider.
+            let bar_w = if self.fit_passes_remaining > 0 || layout_changed {
+                intrinsic_bar_w
+            } else {
+                (ui.available_width() - group_pad).max(intrinsic_bar_w)
+            };
 
-                    let total_label = if snap.cpu_avg_mhz > 0 {
-                        format!(
-                            "Total: {:.1}%  (Avg: {})",
-                            snap.cpu_total_pct,
-                            format_mhz(snap.cpu_avg_mhz)
-                        )
-                    } else {
-                        format!("Total: {:.1}%", snap.cpu_total_pct)
-                    };
-
-                    ui.add(
-                        ProgressBar::new(snap.cpu_total_pct / 100.0)
-                            .text(total_label)
-                            .fill(Color32::from_rgb(0, 150, 180)),
-                    );
-
-                    if self.config.show_per_core && !snap.cpu_cores_pct.is_empty() {
-                        ui.add_space(4.0);
-                        let cols = if snap.cpu_cores_mhz.is_empty() { 4 } else { 3 };
-                        // Scale cell width proportionally with the user's chosen font size
-                        let scale = self.config.font_size / 13.0;
-                        let cell_w = if snap.cpu_cores_mhz.is_empty() {
-                            88.0 * scale
-                        } else {
-                            126.0 * scale
-                        };
-
-                        egui::Grid::new("cpu_cores_grid")
-                            .num_columns(cols)
-                            .spacing([6.0, 4.0])
-                            .striped(true)
-                            .show(ui, |ui| {
-                                for (idx, &pct) in snap.cpu_cores_pct.iter().enumerate() {
-                                    let cell_text = if let Some(&mhz) = snap.cpu_cores_mhz.get(idx)
-                                    {
-                                        if mhz > 0 {
-                                            format!(
-                                                "C{idx}: {pct:.0}% • {:.2}G",
-                                                mhz as f32 / 1000.0
-                                            )
-                                        } else {
-                                            format!("C{idx}: {pct:.0}%")
-                                        }
-                                    } else {
-                                        format!("C{idx}: {pct:.0}%")
-                                    };
-
-                                    ui.add(
-                                        ProgressBar::new(pct / 100.0)
-                                            .text(cell_text)
-                                            .desired_width(cell_w),
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let inner = ui.vertical(|ui| {
+                        // --- CPU SECTION ---
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("CPU").strong());
+                                ui.label(
+                                    RichText::new(format!("{:.1} °C", snap.cpu_temp_c))
+                                        .color(Color32::from_rgb(0, 188, 212)),
+                                );
+                                if snap.cpu_avg_mhz > 0 {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "• Avg: {}",
+                                            format_mhz(snap.cpu_avg_mhz)
+                                        ))
+                                        .color(Color32::from_rgb(128, 222, 234)),
                                     );
-                                    if (idx + 1) % cols == 0 {
-                                        ui.end_row();
-                                    }
+                                }
+                                if ui
+                                    .checkbox(&mut self.config.show_per_core, "Per-Core")
+                                    .changed()
+                                {
+                                    config_dirty = true;
+                                    layout_changed = true;
                                 }
                             });
-                    }
-                });
 
-                ui.add_space(4.0);
-
-                // --- MEMORY & ZRAM SECTION ---
-                ui.group(|ui| {
-                    let m = &snap.mem;
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Memory & Swap").strong());
-                        if m.ram_speed_mts > 0 {
-                            ui.label(
-                                RichText::new(format!("• {} MT/s", m.ram_speed_mts))
-                                    .color(Color32::from_rgb(186, 104, 200)),
-                            );
-                        }
-                    });
-
-                    ui.add(
-                        ProgressBar::new(m.ram_pct / 100.0)
-                            .text(format!(
-                                "RAM: {:.2} / {:.2} GiB ({:.1}%)",
-                                m.ram_used_mb as f32 / 1024.0,
-                                m.ram_total_mb as f32 / 1024.0,
-                                m.ram_pct
-                            ))
-                            .fill(Color32::from_rgb(142, 68, 173)),
-                    );
-
-                    if m.swap_total_mb > 0 {
-                        ui.add_space(2.0);
-                        ui.add(
-                            ProgressBar::new(m.swap_pct / 100.0)
-                                .text(format!(
-                                    "Swap: {:.2} / {:.2} GiB ({:.1}%)",
-                                    m.swap_used_mb as f32 / 1024.0,
-                                    m.swap_total_mb as f32 / 1024.0,
-                                    m.swap_pct
-                                ))
-                                .fill(Color32::from_rgb(110, 80, 150)),
-                        );
-                    }
-
-                    for z in &snap.zrams {
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("ZRAM ({} [{}])", z.name, z.algorithm))
-                                    .strong(),
-                            );
-                            ui.label(
-                                RichText::new(format!("Ratio: {:.2}x", z.ratio))
-                                    .color(Color32::from_rgb(129, 199, 132)),
-                            );
-                        });
-                        ui.label(format!(
-                            "Data: {} → Compr: {} | RAM: {} / {}",
-                            format_bytes(z.data_bytes),
-                            format_bytes(z.compr_bytes),
-                            format_bytes(z.total_ram_bytes),
-                            format_bytes(z.disksize_bytes),
-                        ));
-                    }
-                });
-
-                // --- GPUS SECTION ---
-                for (idx, gpu) in snap.gpus.iter().enumerate() {
-                    ui.add_space(4.0);
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("GPU {idx}: {} [{}]", gpu.name, gpu.id))
-                                    .strong(),
-                            );
-                            ui.label(
-                                RichText::new(format!(
-                                    "• {} °C | {:.1} W",
-                                    gpu.temp_c, gpu.power_w
-                                ))
-                                .color(Color32::from_rgb(102, 187, 106)),
-                            );
-                        });
-
-                        ui.add(
-                            ProgressBar::new(gpu.load_pct as f32 / 100.0)
-                                .text(format!(
-                                    "Clock Load: {}%  ({} / {} MHz)",
-                                    gpu.load_pct, gpu.freq_mhz, gpu.max_freq_mhz
-                                ))
-                                .fill(Color32::from_rgb(56, 142, 60)),
-                        );
-
-                        if gpu.vram_total_mb > 0 {
-                            let vram_frac = (gpu.vram_used_mb as f32 / gpu.vram_total_mb as f32)
-                                .clamp(0.0, 1.0);
-                            let vclk_str = if gpu.vram_freq_mhz > 0 {
-                                format!(" @ {} MHz", gpu.vram_freq_mhz)
-                            } else {
-                                String::new()
-                            };
-                            ui.add_space(2.0);
-                            ui.add(
-                                ProgressBar::new(vram_frac)
-                                    .text(format!(
-                                        "VRAM: {} / {} MiB ({:.0}%){}",
-                                        gpu.vram_used_mb,
-                                        gpu.vram_total_mb,
-                                        vram_frac * 100.0,
-                                        vclk_str
-                                    ))
-                                    .fill(Color32::from_rgb(46, 110, 90)),
-                            );
-                        } else {
-                            let unified_text = if snap.mem.ram_speed_mts > 0 {
+                            let total_label = if snap.cpu_avg_mhz > 0 {
                                 format!(
-                                    "Unified Memory (Shared RAM @ {} MT/s)",
-                                    snap.mem.ram_speed_mts
+                                    "Total: {:.1}%  (Avg: {})",
+                                    snap.cpu_total_pct,
+                                    format_mhz(snap.cpu_avg_mhz)
                                 )
                             } else {
-                                "Unified Memory (Shared System RAM)".to_string()
+                                format!("Total: {:.1}%", snap.cpu_total_pct)
                             };
-                            ui.label(RichText::new(unified_text).weak());
+
+                            ui.add(
+                                ProgressBar::new(snap.cpu_total_pct / 100.0)
+                                    .desired_width(bar_w)
+                                    .desired_height(bar_height)
+                                    .text(total_label)
+                                    .fill(Color32::from_rgb(0, 150, 180)),
+                            );
+
+                            if self.config.show_per_core && !snap.cpu_cores_pct.is_empty() {
+                                ui.add_space(4.0);
+                                egui::Grid::new("cpu_cores_grid")
+                                    .num_columns(cols)
+                                    .spacing([6.0, 4.0])
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        for (idx, &pct) in snap.cpu_cores_pct.iter().enumerate() {
+                                            let cell_text =
+                                                if let Some(&mhz) = snap.cpu_cores_mhz.get(idx) {
+                                                    if mhz > 0 {
+                                                        format!(
+                                                            "C{idx}: {pct:.0}% • {:.2}G",
+                                                            mhz as f32 / 1000.0
+                                                        )
+                                                    } else {
+                                                        format!("C{idx}: {pct:.0}%")
+                                                    }
+                                                } else {
+                                                    format!("C{idx}: {pct:.0}%")
+                                                };
+
+                                            ui.add(
+                                                ProgressBar::new(pct / 100.0)
+                                                    .desired_height(bar_height)
+                                                    .text(cell_text)
+                                                    .desired_width(cell_w),
+                                            );
+                                            if (idx + 1) % cols == 0 {
+                                                ui.end_row();
+                                            }
+                                        }
+                                    });
+                            }
+                        });
+
+                        ui.add_space(4.0);
+
+                        // --- MEMORY & ZRAM SECTION ---
+                        ui.group(|ui| {
+                            let m = &snap.mem;
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Memory & Swap").strong());
+                                if m.ram_speed_mts > 0 {
+                                    ui.label(
+                                        RichText::new(format!("• {} MT/s", m.ram_speed_mts))
+                                            .color(Color32::from_rgb(186, 104, 200)),
+                                    );
+                                }
+                            });
+
+                            ui.add(
+                                ProgressBar::new(m.ram_pct / 100.0)
+                                    .desired_width(bar_w)
+                                    .desired_height(bar_height)
+                                    .text(format!(
+                                        "RAM: {:.2} / {:.2} GiB ({:.1}%)",
+                                        m.ram_used_mb as f32 / 1024.0,
+                                        m.ram_total_mb as f32 / 1024.0,
+                                        m.ram_pct
+                                    ))
+                                    .fill(Color32::from_rgb(142, 68, 173)),
+                            );
+
+                            if m.swap_total_mb > 0 {
+                                ui.add_space(2.0);
+                                ui.add(
+                                    ProgressBar::new(m.swap_pct / 100.0)
+                                        .desired_width(bar_w)
+                                        .desired_height(bar_height)
+                                        .text(format!(
+                                            "Swap: {:.2} / {:.2} GiB ({:.1}%)",
+                                            m.swap_used_mb as f32 / 1024.0,
+                                            m.swap_total_mb as f32 / 1024.0,
+                                            m.swap_pct
+                                        ))
+                                        .fill(Color32::from_rgb(110, 80, 150)),
+                                );
+                            }
+
+                            for z in &snap.zrams {
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "ZRAM ({} [{}])",
+                                            z.name, z.algorithm
+                                        ))
+                                        .strong(),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!("Ratio: {:.2}x", z.ratio))
+                                            .color(Color32::from_rgb(129, 199, 132)),
+                                    );
+                                });
+                                ui.label(format!(
+                                    "Data: {} → Compr: {} | RAM: {} / {}",
+                                    format_bytes(z.data_bytes),
+                                    format_bytes(z.compr_bytes),
+                                    format_bytes(z.total_ram_bytes),
+                                    format_bytes(z.disksize_bytes),
+                                ));
+                            }
+                        });
+
+                        // --- GPUS SECTION ---
+                        for (idx, gpu) in snap.gpus.iter().enumerate() {
+                            ui.add_space(4.0);
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "GPU {idx}: {} [{}]",
+                                            gpu.name, gpu.id
+                                        ))
+                                        .strong(),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "• {} °C | {:.1} W",
+                                            gpu.temp_c, gpu.power_w
+                                        ))
+                                        .color(Color32::from_rgb(102, 187, 106)),
+                                    );
+                                });
+
+                                ui.add(
+                                    ProgressBar::new(gpu.load_pct as f32 / 100.0)
+                                        .desired_width(bar_w)
+                                        .desired_height(bar_height)
+                                        .text(format!(
+                                            "Clock Load: {}%  ({} / {} MHz)",
+                                            gpu.load_pct, gpu.freq_mhz, gpu.max_freq_mhz
+                                        ))
+                                        .fill(Color32::from_rgb(56, 142, 60)),
+                                );
+
+                                if gpu.vram_total_mb > 0 {
+                                    let vram_frac = (gpu.vram_used_mb as f32
+                                        / gpu.vram_total_mb as f32)
+                                        .clamp(0.0, 1.0);
+                                    let vclk_str = if gpu.vram_freq_mhz > 0 {
+                                        format!(" @ {} MHz", gpu.vram_freq_mhz)
+                                    } else {
+                                        String::new()
+                                    };
+                                    ui.add_space(2.0);
+                                    ui.add(
+                                        ProgressBar::new(vram_frac)
+                                            .desired_width(bar_w)
+                                            .desired_height(bar_height)
+                                            .text(format!(
+                                                "VRAM: {} / {} MiB ({:.0}%){}",
+                                                gpu.vram_used_mb,
+                                                gpu.vram_total_mb,
+                                                vram_frac * 100.0,
+                                                vclk_str
+                                            ))
+                                            .fill(Color32::from_rgb(46, 110, 90)),
+                                    );
+                                } else {
+                                    let unified_text = if snap.mem.ram_speed_mts > 0 {
+                                        format!(
+                                            "Unified Memory (Shared RAM @ {} MT/s)",
+                                            snap.mem.ram_speed_mts
+                                        )
+                                    } else {
+                                        "Unified Memory (Shared System RAM)".to_string()
+                                    };
+                                    ui.label(RichText::new(unified_text).weak());
+                                }
+                            });
                         }
                     });
-                }
-            });
 
-            content_size = inner.response.rect.size();
+                    content_height = inner.response.rect.height();
+                });
         });
 
         if config_dirty {
@@ -923,12 +1000,16 @@ impl eframe::App for MonitorWindowApp {
             self.trigger_auto_fit();
         }
 
-        // Fit window tightly to the displayed text & bars without locking out manual resizing
+        // Compute target window size purely from intrinsic bar/top-bar widths + measured vertical height
         if self.fit_passes_remaining > 0 {
             self.fit_passes_remaining -= 1;
             let margin = ctx.style().spacing.window_margin;
-            let target_w = content_size.x.max(top_bar_req_w) + margin.left + margin.right + 4.0;
-            let target_h = top_bar_h + content_size.y + margin.top + margin.bottom + 4.0;
+            let horiz_pad = margin.left + margin.right + group_pad + 6.0;
+            let vert_pad = (margin.top + margin.bottom) * 2.0 + 16.0;
+
+            let target_w = (intrinsic_bar_w + horiz_pad)
+                .max(top_bar_intrinsic_w + margin.left + margin.right + 8.0);
+            let target_h = top_bar_h + content_height + vert_pad;
             let target = Vec2::new(target_w.ceil(), target_h.ceil());
 
             if target.x > 50.0 && target.y > 50.0 && (target - self.last_fitted_size).length() > 1.0
@@ -936,6 +1017,7 @@ impl eframe::App for MonitorWindowApp {
                 self.last_fitted_size = target;
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
             }
+            ctx.request_repaint();
         }
     }
 }
@@ -945,7 +1027,6 @@ fn run_gui_worker() -> anyhow::Result<()> {
     let initial_snapshot = collector.sample()?;
     let config = AppConfig::load();
 
-    // Sync IPC interval with saved config on launch
     let initial_ms = fs::read_to_string(IPC_INTERVAL_FILE)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -984,12 +1065,21 @@ fn run_gui_worker() -> anyhow::Result<()> {
         }
     });
 
+    let scale = config.font_size / 13.0;
+    let mono_factor = if config.font_choice == FontChoice::Mono {
+        1.15
+    } else {
+        1.0
+    };
+    let init_w = (480.0 * scale * mono_factor).max(340.0);
+    let init_h = (360.0 * scale).max(220.0);
+
     let native_options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_title("KDE Rust Hardware Monitor")
             .with_app_id("org.kde.rustmon")
             .with_resizable(true)
-            .with_inner_size([360.0, 220.0])
+            .with_inner_size([init_w, init_h])
             .with_min_inner_size([260.0, 140.0]),
         ..Default::default()
     };
