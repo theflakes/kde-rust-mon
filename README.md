@@ -1,4 +1,3 @@
-```markdown
 # kde-rust-mon
 
 This was created by Gemini Argon as a test.
@@ -129,7 +128,3 @@ X-KDE-AutostartPhase=2
 
 * **KDE Plasma:** Left-clicking the tray icon toggles the stats window; hovering displays the full multi-GPU/ZRAM tooltip; right-clicking adjusts the polling interval or quits.
 * **GNOME:** Requires the **AppIndicator and KStatusNotifierItem Support** extension (`gnome-shell-extension-appindicator`). Left-clicking the tray icon opens the menu containing **Toggle Stats Window**.
-
-```
-
-```
