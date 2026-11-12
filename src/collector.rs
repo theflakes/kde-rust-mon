@@ -14,6 +14,7 @@ pub struct GpuMetrics {
     pub vram_used_mb: u64,
     pub vram_total_mb: u64,
     pub vram_freq_mhz: u32,
+    pub vram_max_freq_mhz: u32,
     pub temp_c: u32,
     pub power_w: f32,
     pub freq_mhz: u32,
@@ -578,6 +579,7 @@ impl HardwareCollector {
                 let freq_mhz = dev.clock_info(Clock::Graphics).unwrap_or(0);
                 let max_freq_mhz = dev.max_clock_info(Clock::Graphics).unwrap_or(0);
                 let vram_freq_mhz = dev.clock_info(Clock::Memory).unwrap_or(0);
+                let vram_max_freq_mhz = dev.max_clock_info(Clock::Memory).unwrap_or(0);
 
                 let load_pct = if max_freq_mhz > 0 {
                     ((freq_mhz as f32 / max_freq_mhz as f32) * 100.0)
@@ -594,6 +596,7 @@ impl HardwareCollector {
                     vram_used_mb,
                     vram_total_mb,
                     vram_freq_mhz,
+                    vram_max_freq_mhz,
                     temp_c,
                     power_w,
                     freq_mhz,
@@ -627,9 +630,9 @@ impl HardwareCollector {
                 0
             };
 
-            let vram_freq_mhz = match &mut gpu.vram_clock_sensor {
-                Some(VramClockSensor::AmdDpmMclk(mclk_file)) => parse_amd_dpm_clock(mclk_file).0,
-                None => 0,
+            let (vram_freq_mhz, vram_max_freq_mhz) = match &mut gpu.vram_clock_sensor {
+                Some(VramClockSensor::AmdDpmMclk(mclk_file)) => parse_amd_dpm_clock(mclk_file),
+                None => (0, 0),
             };
 
             let vram_used_mb = gpu
@@ -659,6 +662,7 @@ impl HardwareCollector {
                 vram_used_mb,
                 vram_total_mb: gpu.vram_total_mb,
                 vram_freq_mhz,
+                vram_max_freq_mhz,
                 temp_c,
                 power_w,
                 freq_mhz,
@@ -833,9 +837,7 @@ impl HardwareCollector {
         (None, None)
     }
 
-    /// Discovers CPU package/core wattage via Intel RAPL (`powercap`) or AMD `hwmon` (`k10temp`/`zenpower`).
     fn find_cpu_power_sensor() -> Option<PowerSensor> {
-        // 1. Check AMD/Intel hwmon direct power/energy sensors first
         if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -860,12 +862,9 @@ impl HardwareCollector {
             }
         }
 
-        // 2. Intel RAPL Package Power (`package-0` at `/sys/class/powercap/intel-rapl:0/energy_uj`)
         Self::find_intel_rapl_sensor(false)
     }
 
-    /// If `prefer_uncore` is true, picks the `uncore` (iGPU) sub-domain if exposed, falling back to `package-0`.
-    /// If `prefer_uncore` is false, reads `package-0` directly for total CPU package wattage.
     fn find_intel_rapl_sensor(prefer_uncore: bool) -> Option<PowerSensor> {
         let rapl_root = Path::new("/sys/class/powercap/intel-rapl:0");
         if !rapl_root.exists() {

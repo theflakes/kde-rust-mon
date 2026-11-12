@@ -366,11 +366,7 @@ impl Tray for KdeResourceTray {
             html.push_str("<hr/>");
             for (idx, gpu) in self.snapshot.gpus.iter().enumerate() {
                 let mem_line = if gpu.vram_total_mb > 0 {
-                    let vclk = if gpu.vram_freq_mhz > 0 {
-                        format!(" @ {} MHz", gpu.vram_freq_mhz)
-                    } else {
-                        String::new()
-                    };
+                    let vclk = format_vram_clock(gpu.vram_freq_mhz, gpu.vram_max_freq_mhz);
                     format!(
                         "VRAM: {} / {} MiB{}",
                         gpu.vram_used_mb, gpu.vram_total_mb, vclk
@@ -611,6 +607,16 @@ fn measure_text_width(ctx: &egui::Context, text: &str, choice: FontChoice, size:
     })
 }
 
+fn format_vram_clock(active_mhz: u32, max_mhz: u32) -> String {
+    if active_mhz > 0 && max_mhz > 0 {
+        format!(" @ {active_mhz} / {max_mhz} MHz")
+    } else if active_mhz > 0 {
+        format!(" @ {active_mhz} MHz")
+    } else {
+        String::new()
+    }
+}
+
 impl eframe::App for MonitorWindowApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.initialized_style {
@@ -620,9 +626,6 @@ impl eframe::App for MonitorWindowApp {
             ctx.request_repaint();
         }
 
-        // Wayland compositors (KWin) often ignore resize requests sent during the very first
-        // xdg_surface map frame. Re-triggering auto-fit 150ms after launch ensures a tight fit
-        // once the compositor has mapped the window.
         if !self.post_map_fitted && self.started_at.elapsed() >= Duration::from_millis(150) {
             self.post_map_fitted = true;
             self.trigger_auto_fit();
@@ -739,7 +742,8 @@ impl eframe::App for MonitorWindowApp {
         let sample_strings = [
             "Data: 99.9G → Compr: 99.9G | RAM: 99.9G / 99.9G",
             "RAM: 99.99 / 99.99 GiB (100.0%)  ",
-            "Clock Load: 100%  (2500 / 2500 MHz)  ",
+            "VRAM: 8176 / 8176 MiB (100%) @ 2800 / 2800 MHz",
+            "Clock Load: 100%  (3100 / 3100 MHz)  ",
             "Unified Memory (Shared RAM @ 8533 MT/s)",
         ];
         let max_line_w = sample_strings
@@ -971,11 +975,8 @@ impl eframe::App for MonitorWindowApp {
                                     let vram_frac = (gpu.vram_used_mb as f32
                                         / gpu.vram_total_mb as f32)
                                         .clamp(0.0, 1.0);
-                                    let vclk_str = if gpu.vram_freq_mhz > 0 {
-                                        format!(" @ {} MHz", gpu.vram_freq_mhz)
-                                    } else {
-                                        String::new()
-                                    };
+                                    let vclk_str =
+                                        format_vram_clock(gpu.vram_freq_mhz, gpu.vram_max_freq_mhz);
                                     ui.add_space(2.0);
                                     ui.add(
                                         ProgressBar::new(vram_frac)
@@ -1034,7 +1035,6 @@ impl eframe::App for MonitorWindowApp {
             }
             ctx.request_repaint();
         } else if !self.post_map_fitted {
-            // Keep repainting briefly until the 150ms post-map fit completes
             ctx.request_repaint();
         }
     }
@@ -1052,7 +1052,6 @@ fn run_gui_worker() -> anyhow::Result<()> {
         .unwrap_or(config.interval_ms);
     let _ = fs::write(IPC_INTERVAL_FILE, initial_ms.to_string());
 
-    // Pre-estimate initial height based on active sections so Wayland's initial surface is tall enough
     let scale = config.font_size / 13.0;
     let mono_factor = if config.font_choice == FontChoice::Mono {
         1.15
