@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 mod collector;
 
 use collector::{GpuMetrics, HardwareCollector, MemoryMetrics, SystemSnapshot, ZramMetrics};
@@ -12,12 +14,9 @@ use ksni::{
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -28,7 +27,7 @@ use std::time::{Duration, Instant};
 const POLL_INTERVALS_MS: [u64; 4] = [500, 1000, 1500, 2000];
 
 // ============================================================================
-// Zero-Dependency Binary Snapshot Framing over UnixStream Socketpair
+// Zero-Dependency Binary Snapshot Framing over Standard Pipes
 // ============================================================================
 
 fn write_str(buf: &mut Vec<u8>, s: &str) {
@@ -37,13 +36,13 @@ fn write_str(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(bytes);
 }
 
-fn read_str<R: Read>(r: &mut R) -> std::io::Result<String> {
+fn read_str<R: Read>(r: &mut R) -> io::Result<String> {
     let mut len_b = [0u8; 4];
     r.read_exact(&mut len_b)?;
     let len = u32::from_le_bytes(len_b) as usize;
     if len > 4096 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
             "string too long",
         ));
     }
@@ -52,19 +51,19 @@ fn read_str<R: Read>(r: &mut R) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn read_u32<R: Read>(r: &mut R) -> std::io::Result<u32> {
+fn read_u32<R: Read>(r: &mut R) -> io::Result<u32> {
     let mut b = [0u8; 4];
     r.read_exact(&mut b)?;
     Ok(u32::from_le_bytes(b))
 }
 
-fn read_u64<R: Read>(r: &mut R) -> std::io::Result<u64> {
+fn read_u64<R: Read>(r: &mut R) -> io::Result<u64> {
     let mut b = [0u8; 8];
     r.read_exact(&mut b)?;
     Ok(u64::from_le_bytes(b))
 }
 
-fn read_f32<R: Read>(r: &mut R) -> std::io::Result<f32> {
+fn read_f32<R: Read>(r: &mut R) -> io::Result<f32> {
     let mut b = [0u8; 4];
     r.read_exact(&mut b)?;
     Ok(f32::from_le_bytes(b))
@@ -128,14 +127,14 @@ fn encode_snapshot(snap: &SystemSnapshot, out: &mut Vec<u8>) {
     out[0..4].copy_from_slice(&payload_len.to_le_bytes());
 }
 
-fn decode_snapshot<R: Read>(r: &mut R) -> std::io::Result<SystemSnapshot> {
+fn decode_snapshot<R: Read>(r: &mut R) -> io::Result<SystemSnapshot> {
     let _payload_len = read_u32(r)?;
 
     let cpu_total_pct = read_f32(r)?;
     let n_cores = read_u32(r)? as usize;
     if n_cores > 1024 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
             "invalid core count",
         ));
     }
@@ -147,8 +146,8 @@ fn decode_snapshot<R: Read>(r: &mut R) -> std::io::Result<SystemSnapshot> {
     let cpu_avg_mhz = read_u32(r)?;
     let n_freqs = read_u32(r)? as usize;
     if n_freqs > 1024 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
             "invalid freq count",
         ));
     }
@@ -172,8 +171,8 @@ fn decode_snapshot<R: Read>(r: &mut R) -> std::io::Result<SystemSnapshot> {
 
     let n_zrams = read_u32(r)? as usize;
     if n_zrams > 64 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
             "invalid zram count",
         ));
     }
@@ -192,8 +191,8 @@ fn decode_snapshot<R: Read>(r: &mut R) -> std::io::Result<SystemSnapshot> {
 
     let n_gpus = read_u32(r)? as usize;
     if n_gpus > 32 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
             "invalid gpu count",
         ));
     }
@@ -362,7 +361,7 @@ impl AppConfig {
 
 struct ActiveGuiClient {
     child: Child,
-    stream: UnixStream,
+    stdin: ChildStdin,
 }
 
 struct TraySharedState {
@@ -385,60 +384,70 @@ impl TraySharedState {
         false
     }
 
-    fn open_window(&self) {
+    fn open_window(self: &Arc<Self>) {
         if self.is_window_open() {
             return;
         }
         let Ok(exe) = env::current_exe() else {
             return;
         };
-        let Ok((mut parent_sock, child_sock)) = UnixStream::pair() else {
+
+        let Ok(mut child) = Command::new(exe)
+            .arg("--gui-worker")
+            .arg("--piped")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+        else {
             return;
         };
 
-        let raw_child_fd = child_sock.as_raw_fd();
-        let mut cmd = Command::new(exe);
-        cmd.arg("--gui-worker").arg(raw_child_fd.to_string());
+        let Some(mut stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        };
 
-        unsafe {
-            cmd.pre_exec(move || {
-                let flags = fcntl(raw_child_fd, 1); // F_GETFD
-                if flags >= 0 {
-                    fcntl(raw_child_fd, 2, flags & !1); // F_SETFD without FD_CLOEXEC
+        // Send immediate initial snapshot over stdin pipe
+        if let (Ok(snap), Ok(mut buf)) = (self.latest_snapshot.lock(), self.encode_buf.lock()) {
+            encode_snapshot(&snap, &mut buf);
+            if stdin.write_all(&buf).is_err() || stdin.flush().is_err() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+        }
+
+        // Listen on child's stdout pipe for 8-byte polling interval updates from the GUI
+        if let Some(mut stdout) = child.stdout.take() {
+            let shared_ref = Arc::clone(self);
+            thread::spawn(move || {
+                let mut ms_buf = [0u8; 8];
+                while stdout.read_exact(&mut ms_buf).is_ok() {
+                    let ms = u64::from_le_bytes(ms_buf);
+                    if POLL_INTERVALS_MS.contains(&ms) {
+                        shared_ref.interval_ms.store(ms, Ordering::Relaxed);
+                    }
                 }
-                Ok(())
             });
         }
 
-        if let Ok(child) = cmd.spawn() {
-            drop(child_sock);
-
-            if let (Ok(snap), Ok(mut buf)) = (self.latest_snapshot.lock(), self.encode_buf.lock()) {
-                encode_snapshot(&snap, &mut buf);
-                if parent_sock.write_all(&buf).is_err() {
-                    return;
-                }
-            }
-
-            if let Ok(mut guard) = self.gui_client.lock() {
-                *guard = Some(ActiveGuiClient {
-                    child,
-                    stream: parent_sock,
-                });
-            }
+        if let Ok(mut guard) = self.gui_client.lock() {
+            *guard = Some(ActiveGuiClient { child, stdin });
         }
     }
 
     fn close_window(&self) {
         if let Ok(mut guard) = self.gui_client.lock() {
             if let Some(mut client) = guard.take() {
+                drop(client.stdin);
                 let _ = client.child.kill();
                 let _ = client.child.wait();
             }
         }
     }
 
-    fn toggle_window(&self) {
+    fn toggle_window(self: &Arc<Self>) {
         if self.is_window_open() {
             self.close_window();
         } else {
@@ -466,35 +475,14 @@ impl TraySharedState {
             return;
         }
 
-        let _ = client.stream.set_nonblocking(true);
-        let mut ms_buf = [0u8; 8];
-        while client.stream.read_exact(&mut ms_buf).is_ok() {
-            let ms = u64::from_le_bytes(ms_buf);
-            if POLL_INTERVALS_MS.contains(&ms) {
-                self.interval_ms.store(ms, Ordering::Relaxed);
-            }
-        }
-        let _ = client.stream.set_nonblocking(false);
-
         if let Ok(mut buf) = self.encode_buf.lock() {
             encode_snapshot(snap, &mut buf);
-            if client.stream.write_all(&buf).is_err() {
+            if client.stdin.write_all(&buf).is_err() || client.stdin.flush().is_err() {
                 let _ = client.child.kill();
                 let _ = client.child.wait();
                 *guard = None;
             }
         }
-    }
-}
-
-unsafe extern "C" {
-    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
-    fn signal(sig: i32, handler: usize) -> usize;
-}
-
-unsafe fn ignore_sigpipe() {
-    unsafe {
-        signal(13, 1); // SIGPIPE = 13, SIG_IGN = 1
     }
 }
 
@@ -780,14 +768,14 @@ impl Tray for KdeResourceTray {
 }
 
 // ============================================================================
-// GUI Worker Window Process (Zero-Sysfs-Poll Receiver)
+// GUI Worker Window Process (100% Safe Pipe Receiver)
 // ============================================================================
 
 struct GuiWorkerState {
     snapshot: Mutex<SystemSnapshot>,
     interval_ms: AtomicU64,
     egui_ctx: Mutex<Option<egui::Context>>,
-    ipc_writer: Option<Mutex<UnixStream>>,
+    piped_mode: bool,
 }
 
 struct MonitorWindowApp {
@@ -820,7 +808,6 @@ impl MonitorWindowApp {
             *guard = Some(cc.egui_ctx.clone());
         }
 
-        // Do NOT call ctx.fonts() here—fonts are unavailable until the first Context::run() in update().
         Self {
             state,
             config,
@@ -1039,10 +1026,10 @@ impl eframe::App for MonitorWindowApp {
                                     .store(cur_interval, Ordering::Relaxed);
                                 self.config.interval_ms = cur_interval;
                                 config_dirty = true;
-                                if let Some(ref writer) = self.state.ipc_writer {
-                                    if let Ok(mut w) = writer.lock() {
-                                        let _ = w.write_all(&cur_interval.to_le_bytes());
-                                    }
+                                if self.state.piped_mode {
+                                    let mut stdout = io::stdout().lock();
+                                    let _ = stdout.write_all(&cur_interval.to_le_bytes());
+                                    let _ = stdout.flush();
                                 }
                             }
                         }
@@ -1370,20 +1357,20 @@ impl eframe::App for MonitorWindowApp {
     }
 }
 
-fn run_gui_worker(ipc_fd: Option<i32>) -> anyhow::Result<()> {
+fn run_gui_worker(piped_mode: bool) -> anyhow::Result<()> {
     let config = AppConfig::load();
 
-    let (initial_snapshot, ipc_stream) = if let Some(fd) = ipc_fd {
-        let mut stream = unsafe { UnixStream::from_raw_fd(fd) };
-        let Ok(snap) = decode_snapshot(&mut stream) else {
+    let initial_snapshot = if piped_mode {
+        let mut stdin = io::stdin().lock();
+        let Ok(snap) = decode_snapshot(&mut stdin) else {
             return Ok(());
         };
-        (snap, Some(stream))
+        snap
     } else {
         let mut collector = HardwareCollector::new()?;
         let mut snap = SystemSnapshot::default();
         collector.sample_into(&mut snap)?;
-        (snap, None)
+        snap
     };
 
     let scale = config.font_size / 13.0;
@@ -1411,36 +1398,25 @@ fn run_gui_worker(ipc_fd: Option<i32>) -> anyhow::Result<()> {
     let init_w = (480.0 * scale * mono_factor).max(360.0);
     let init_h = (est_h * scale).max(240.0);
 
-    let (ipc_reader, ipc_writer) = if let Some(stream) = ipc_stream {
-        let writer = stream.try_clone().ok().map(Mutex::new);
-        (Some(stream), writer)
-    } else {
-        (None, None)
-    };
-
     let state = Arc::new(GuiWorkerState {
         snapshot: Mutex::new(initial_snapshot),
         interval_ms: AtomicU64::new(config.interval_ms),
         egui_ctx: Mutex::new(None),
-        ipc_writer,
+        piped_mode,
     });
 
-    let state_bg = state.clone();
-    if let Some(mut reader) = ipc_reader {
+    let state_bg = Arc::clone(&state);
+    if piped_mode {
         thread::spawn(move || {
-            loop {
-                match decode_snapshot(&mut reader) {
-                    Ok(snap) => {
-                        if let Ok(mut guard) = state_bg.snapshot.lock() {
-                            *guard = snap;
-                        }
-                        if let Ok(guard) = state_bg.egui_ctx.lock() {
-                            if let Some(ctx) = &*guard {
-                                ctx.request_repaint();
-                            }
-                        }
+            let mut stdin = io::stdin().lock();
+            while let Ok(snap) = decode_snapshot(&mut stdin) {
+                if let Ok(mut guard) = state_bg.snapshot.lock() {
+                    *guard = snap;
+                }
+                if let Ok(guard) = state_bg.egui_ctx.lock() {
+                    if let Some(ctx) = &*guard {
+                        ctx.request_repaint();
                     }
-                    Err(_) => break,
                 }
             }
         });
@@ -1533,14 +1509,10 @@ fn draw_bar(
 }
 
 fn main() -> anyhow::Result<()> {
-    unsafe {
-        ignore_sigpipe();
-    }
-
     let args: Vec<String> = env::args().collect();
-    if let Some(pos) = args.iter().position(|a| a == "--gui-worker") {
-        let fd = args.get(pos + 1).and_then(|s| s.parse::<i32>().ok());
-        return run_gui_worker(fd);
+    if args.iter().any(|a| a == "--gui-worker") {
+        let piped = args.iter().any(|a| a == "--piped");
+        return run_gui_worker(piped);
     }
 
     let mut collector = HardwareCollector::new()?;
