@@ -19,7 +19,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const POLL_INTERVALS_MS: [u64; 4] = [500, 1000, 1500, 2000];
 const IPC_INTERVAL_FILE: &str = "/tmp/kde-rust-mon-interval";
@@ -318,12 +318,19 @@ impl Tray for KdeResourceTray {
             String::new()
         };
 
+        let cpu_power_tag = if self.snapshot.cpu_power_w > 0.0 {
+            format!(" | {:.1} W", self.snapshot.cpu_power_w)
+        } else {
+            String::new()
+        };
+
         let mut html = format!(
-            "<b>CPU Total:</b> {:.1}%{} ({:.1} °C)<br/>\
+            "<b>CPU Total:</b> {:.1}%{} ({:.1} °C{})<br/>\
              <b>RAM:</b> {:.1} / {:.1} GiB ({:.1}%){}<br/>",
             self.snapshot.cpu_total_pct,
             cpu_freq_tag,
             self.snapshot.cpu_temp_c,
+            cpu_power_tag,
             m.ram_used_mb as f32 / 1024.0,
             m.ram_total_mb as f32 / 1024.0,
             m.ram_pct,
@@ -473,6 +480,8 @@ struct GuiWorkerState {
 struct MonitorWindowApp {
     state: Arc<GuiWorkerState>,
     config: AppConfig,
+    started_at: Instant,
+    post_map_fitted: bool,
     initialized_style: bool,
     fit_passes_remaining: u8,
     last_fitted_size: Vec2,
@@ -500,6 +509,8 @@ impl MonitorWindowApp {
         Self {
             state,
             config,
+            started_at: Instant::now(),
+            post_map_fitted: false,
             initialized_style: false,
             fit_passes_remaining: 4,
             last_fitted_size: Vec2::ZERO,
@@ -609,6 +620,14 @@ impl eframe::App for MonitorWindowApp {
             ctx.request_repaint();
         }
 
+        // Wayland compositors (KWin) often ignore resize requests sent during the very first
+        // xdg_surface map frame. Re-triggering auto-fit 150ms after launch ensures a tight fit
+        // once the compositor has mapped the window.
+        if !self.post_map_fitted && self.started_at.elapsed() >= Duration::from_millis(150) {
+            self.post_map_fitted = true;
+            self.trigger_auto_fit();
+        }
+
         let snap = self
             .state
             .snapshot
@@ -622,8 +641,6 @@ impl eframe::App for MonitorWindowApp {
         let bar_height = self.config.font_size + 6.0;
 
         let top_resp = egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            // `ui.min_rect().width()` measures the true intrinsic width of the horizontal widgets,
-            // never the full viewport width!
             ui.horizontal(|ui| {
                 ui.heading(RichText::new("KDE Monitor").strong());
 
@@ -719,8 +736,6 @@ impl eframe::App for MonitorWindowApp {
         let top_bar_intrinsic_w = top_resp.inner;
         let top_bar_h = top_resp.response.rect.height();
 
-        // Compute deterministic intrinsic width from text glyphs and per-core grid—
-        // completely independent of the current viewport width so shrinking font shrinks the window cleanly.
         let sample_strings = [
             "Data: 99.9G → Compr: 99.9G | RAM: 99.9G / 99.9G",
             "RAM: 99.99 / 99.99 GiB (100.0%)  ",
@@ -751,15 +766,12 @@ impl eframe::App for MonitorWindowApp {
             0.0
         };
 
-        // Group frame adds ~12px horizontal padding; TopBottomPanel adds ~16px window margins
         let group_pad = 14.0;
         let intrinsic_bar_w = max_line_w.max(grid_w).max(top_bar_intrinsic_w - group_pad);
 
         let mut content_height = 0.0f32;
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // During auto-fit passes, pin bar width to `intrinsic_bar_w` so shrinking font shrinks width;
-            // once settled, let bars stretch if the user manually drags the window wider.
             let bar_w = if self.fit_passes_remaining > 0 || layout_changed {
                 intrinsic_bar_w
             } else {
@@ -774,9 +786,13 @@ impl eframe::App for MonitorWindowApp {
                         ui.group(|ui| {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new("CPU").strong());
+                                let cpu_meta = if snap.cpu_power_w > 0.0 {
+                                    format!("{:.1} °C | {:.1} W", snap.cpu_temp_c, snap.cpu_power_w)
+                                } else {
+                                    format!("{:.1} °C", snap.cpu_temp_c)
+                                };
                                 ui.label(
-                                    RichText::new(format!("{:.1} °C", snap.cpu_temp_c))
-                                        .color(Color32::from_rgb(0, 188, 212)),
+                                    RichText::new(cpu_meta).color(Color32::from_rgb(0, 188, 212)),
                                 );
                                 if snap.cpu_avg_mhz > 0 {
                                     ui.label(
@@ -1000,7 +1016,6 @@ impl eframe::App for MonitorWindowApp {
             self.trigger_auto_fit();
         }
 
-        // Compute target window size purely from intrinsic bar/top-bar widths + measured vertical height
         if self.fit_passes_remaining > 0 {
             self.fit_passes_remaining -= 1;
             let margin = ctx.style().spacing.window_margin;
@@ -1018,6 +1033,9 @@ impl eframe::App for MonitorWindowApp {
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
             }
             ctx.request_repaint();
+        } else if !self.post_map_fitted {
+            // Keep repainting briefly until the 150ms post-map fit completes
+            ctx.request_repaint();
         }
     }
 }
@@ -1033,6 +1051,32 @@ fn run_gui_worker() -> anyhow::Result<()> {
         .filter(|ms| POLL_INTERVALS_MS.contains(ms))
         .unwrap_or(config.interval_ms);
     let _ = fs::write(IPC_INTERVAL_FILE, initial_ms.to_string());
+
+    // Pre-estimate initial height based on active sections so Wayland's initial surface is tall enough
+    let scale = config.font_size / 13.0;
+    let mono_factor = if config.font_choice == FontChoice::Mono {
+        1.15
+    } else {
+        1.0
+    };
+    let mut est_h = 260.0;
+    if config.show_per_core && !initial_snapshot.cpu_cores_pct.is_empty() {
+        let cols = if initial_snapshot.cpu_cores_mhz.is_empty() {
+            4
+        } else {
+            3
+        };
+        let rows = initial_snapshot.cpu_cores_pct.len().div_ceil(cols);
+        est_h += rows as f32 * 24.0;
+    }
+    if initial_snapshot.mem.swap_total_mb > 0 {
+        est_h += 24.0;
+    }
+    est_h += initial_snapshot.zrams.len() as f32 * 48.0;
+    est_h += initial_snapshot.gpus.len() as f32 * 82.0;
+
+    let init_w = (480.0 * scale * mono_factor).max(360.0);
+    let init_h = (est_h * scale).max(240.0);
 
     let state = Arc::new(GuiWorkerState {
         snapshot: Mutex::new(initial_snapshot),
@@ -1064,15 +1108,6 @@ fn run_gui_worker() -> anyhow::Result<()> {
             }
         }
     });
-
-    let scale = config.font_size / 13.0;
-    let mono_factor = if config.font_choice == FontChoice::Mono {
-        1.15
-    } else {
-        1.0
-    };
-    let init_w = (480.0 * scale * mono_factor).max(340.0);
-    let init_h = (360.0 * scale).max(220.0);
 
     let native_options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()

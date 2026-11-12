@@ -49,6 +49,7 @@ pub struct SystemSnapshot {
     pub cpu_avg_mhz: u32,
     pub cpu_cores_mhz: Vec<u32>,
     pub cpu_temp_c: f32,
+    pub cpu_power_w: f32,
     pub mem: MemoryMetrics,
     pub zrams: Vec<ZramMetrics>,
     pub gpus: Vec<GpuMetrics>,
@@ -84,6 +85,35 @@ enum PowerSensor {
     },
 }
 
+impl PowerSensor {
+    fn sample_watts(&mut self, now: Instant) -> f32 {
+        match self {
+            PowerSensor::DirectMicrowatts(file) => read_u64_fast(file)
+                .map(|uw| uw as f32 / 1_000_000.0)
+                .unwrap_or(0.0),
+            PowerSensor::EnergyMicrojoules {
+                file,
+                prev_uj,
+                prev_instant,
+            } => {
+                let dt = now.duration_since(*prev_instant).as_secs_f32();
+                *prev_instant = now;
+                if let Ok(cur_uj) = read_u64_fast(file) {
+                    let delta_uj = cur_uj.wrapping_sub(*prev_uj);
+                    *prev_uj = cur_uj;
+                    if dt > 0.05 {
+                        (delta_uj as f32 / 1_000_000.0) / dt
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+}
+
 struct SysfsGpuHandle {
     id: String,
     name: String,
@@ -111,6 +141,7 @@ pub struct HardwareCollector {
     prev_cpu_total: CpuTimes,
     prev_cpu_cores: Vec<CpuTimes>,
     cpu_temp_file: Option<File>,
+    cpu_power_sensor: Option<PowerSensor>,
     ram_speed_mts: u32,
     zram_handles: Vec<ZramHandle>,
     nvml: Option<Nvml>,
@@ -128,6 +159,7 @@ impl HardwareCollector {
             None
         };
         let cpu_temp_file = Self::find_cpu_temp_sensor();
+        let cpu_power_sensor = Self::find_cpu_power_sensor();
         let ram_speed_mts = Self::detect_ram_speed_mts();
         let zram_handles = Self::discover_zram_devices();
         let nvml = Nvml::init().ok();
@@ -142,6 +174,7 @@ impl HardwareCollector {
             prev_cpu_total: CpuTimes::default(),
             prev_cpu_cores: Vec::new(),
             cpu_temp_file,
+            cpu_power_sensor,
             ram_speed_mts,
             zram_handles,
             nvml,
@@ -153,6 +186,7 @@ impl HardwareCollector {
     }
 
     pub fn sample(&mut self) -> Result<SystemSnapshot> {
+        let now = Instant::now();
         let (cpu_total_pct, cpu_cores_pct) = self.sample_cpu()?;
         let (cpu_avg_mhz, cpu_cores_mhz) = self.sample_cpu_freqs();
         let mem = self.sample_memory()?;
@@ -164,9 +198,15 @@ impl HardwareCollector {
             .map(|millideg| millideg as f32 / 1000.0)
             .unwrap_or(0.0);
 
+        let cpu_power_w = self
+            .cpu_power_sensor
+            .as_mut()
+            .map(|s| s.sample_watts(now))
+            .unwrap_or(0.0);
+
         let mut gpus = Vec::new();
         self.sample_nvml_gpus(&mut gpus);
-        self.sample_sysfs_gpus(&mut gpus);
+        self.sample_sysfs_gpus(&mut gpus, now);
 
         Ok(SystemSnapshot {
             cpu_total_pct,
@@ -174,6 +214,7 @@ impl HardwareCollector {
             cpu_avg_mhz,
             cpu_cores_mhz,
             cpu_temp_c,
+            cpu_power_w,
             mem,
             zrams,
             gpus,
@@ -201,7 +242,6 @@ impl HardwareCollector {
             }
         }
 
-        // Sort numerically (cpu0, cpu1, ..., cpu10) rather than lexicographically
         entries_vec.sort_by_key(|(idx, _)| *idx);
 
         entries_vec
@@ -217,7 +257,6 @@ impl HardwareCollector {
             let mut active_count = 0u64;
 
             for file in &mut self.cpu_freq_files {
-                // scaling_cur_freq is in kHz
                 let mhz = read_u64_fast(file)
                     .map(|khz| (khz / 1000) as u32)
                     .unwrap_or(0);
@@ -237,7 +276,6 @@ impl HardwareCollector {
             return (avg_mhz, per_core);
         }
 
-        // Fallback to /proc/cpuinfo if cpufreq sysfs is unavailable
         if let Some(file) = &mut self.proc_cpuinfo {
             if file.seek(SeekFrom::Start(0)).is_ok() {
                 self.stat_buf.clear();
@@ -565,9 +603,7 @@ impl HardwareCollector {
         }
     }
 
-    fn sample_sysfs_gpus(&mut self, out: &mut Vec<GpuMetrics>) {
-        let now = Instant::now();
-
+    fn sample_sysfs_gpus(&mut self, out: &mut Vec<GpuMetrics>, now: Instant) {
         for gpu in &mut self.sysfs_gpus {
             let (freq_mhz, max_freq_mhz) = match &mut gpu.clock_sensor {
                 ClockSensor::DirectFreqFile { act_file, max_mhz } => {
@@ -610,31 +646,11 @@ impl HardwareCollector {
                 .map(|m| (m / 1000) as u32)
                 .unwrap_or(0);
 
-            let power_w = match &mut gpu.power_sensor {
-                Some(PowerSensor::DirectMicrowatts(file)) => read_u64_fast(file)
-                    .map(|uw| uw as f32 / 1_000_000.0)
-                    .unwrap_or(0.0),
-                Some(PowerSensor::EnergyMicrojoules {
-                    file,
-                    prev_uj,
-                    prev_instant,
-                }) => {
-                    let dt = now.duration_since(*prev_instant).as_secs_f32();
-                    *prev_instant = now;
-                    if let Ok(cur_uj) = read_u64_fast(file) {
-                        let delta_uj = cur_uj.wrapping_sub(*prev_uj);
-                        *prev_uj = cur_uj;
-                        if dt > 0.05 {
-                            (delta_uj as f32 / 1_000_000.0) / dt
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        0.0
-                    }
-                }
-                None => 0.0,
-            };
+            let power_w = gpu
+                .power_sensor
+                .as_mut()
+                .map(|s| s.sample_watts(now))
+                .unwrap_or(0.0);
 
             out.push(GpuMetrics {
                 id: gpu.id.clone(),
@@ -810,27 +826,62 @@ impl HardwareCollector {
 
         if vendor == "0x8086" {
             let temp = Self::find_cpu_temp_sensor();
-            let power = Self::find_intel_rapl_sensor();
+            let power = Self::find_intel_rapl_sensor(true);
             return (temp, power);
         }
 
         (None, None)
     }
 
-    fn find_intel_rapl_sensor() -> Option<PowerSensor> {
+    /// Discovers CPU package/core wattage via Intel RAPL (`powercap`) or AMD `hwmon` (`k10temp`/`zenpower`).
+    fn find_cpu_power_sensor() -> Option<PowerSensor> {
+        // 1. Check AMD/Intel hwmon direct power/energy sensors first
+        if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Ok(name) = fs::read_to_string(path.join("name")) {
+                    let n = name.trim();
+                    if n == "k10temp" || n == "zenpower" || n == "coretemp" {
+                        if let Ok(f) = File::open(path.join("power1_average"))
+                            .or_else(|_| File::open(path.join("power1_input")))
+                        {
+                            return Some(PowerSensor::DirectMicrowatts(f));
+                        }
+                        if let Ok(mut f) = File::open(path.join("energy1_input")) {
+                            let prev_uj = read_u64_fast(&mut f).unwrap_or(0);
+                            return Some(PowerSensor::EnergyMicrojoules {
+                                file: f,
+                                prev_uj,
+                                prev_instant: Instant::now(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Intel RAPL Package Power (`package-0` at `/sys/class/powercap/intel-rapl:0/energy_uj`)
+        Self::find_intel_rapl_sensor(false)
+    }
+
+    /// If `prefer_uncore` is true, picks the `uncore` (iGPU) sub-domain if exposed, falling back to `package-0`.
+    /// If `prefer_uncore` is false, reads `package-0` directly for total CPU package wattage.
+    fn find_intel_rapl_sensor(prefer_uncore: bool) -> Option<PowerSensor> {
         let rapl_root = Path::new("/sys/class/powercap/intel-rapl:0");
         if !rapl_root.exists() {
             return None;
         }
 
         let mut chosen_energy_path = None;
-        if let Ok(entries) = fs::read_dir(rapl_root) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if let Ok(name) = fs::read_to_string(p.join("name")) {
-                    if name.trim() == "uncore" {
-                        chosen_energy_path = Some(p.join("energy_uj"));
-                        break;
+        if prefer_uncore {
+            if let Ok(entries) = fs::read_dir(rapl_root) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if let Ok(name) = fs::read_to_string(p.join("name")) {
+                        if name.trim() == "uncore" {
+                            chosen_energy_path = Some(p.join("energy_uj"));
+                            break;
+                        }
                     }
                 }
             }
