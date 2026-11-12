@@ -5,6 +5,7 @@ This was created by Gemini Argon as a test.
 A low-overhead, zero-allocation Linux hardware resource monitor built in Rust for KDE Plasma (and compatible with GNOME via AppIndicator). It runs as a native `StatusNotifierItem` system tray icon with an on-demand `eframe`/`egui` dashboard window that frees all GPU/GUI memory when closed.
 
 ## Features
+![KDE Rust Hardware Monitor Window](./pics/window.png)
 
 - **Zero-Allocation Polling:** Uses persistent open file descriptors with `seek(0)` on `/proc/stat`, `/proc/meminfo`, `/sys/class/drm`, `/sys/devices/system/cpu`, and `/sys/block/zram*`—no subprocess spawning (`nvidia-smi`, `sensors`, `dmidecode`, `zramctl`).
 - **CPU Metrics:** Total utilization, package temperature (`coretemp` / `k10temp` / `zenpower`), average clock speed, and expandable per-core utilization and frequencies.
