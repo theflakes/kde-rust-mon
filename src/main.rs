@@ -13,8 +13,9 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
-use std::os::fd::{FromRawFd, IntoRawFd};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::{
@@ -40,6 +41,12 @@ fn read_str<R: Read>(r: &mut R) -> std::io::Result<String> {
     let mut len_b = [0u8; 4];
     r.read_exact(&mut len_b)?;
     let len = u32::from_le_bytes(len_b) as usize;
+    if len > 4096 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "string too long",
+        ));
+    }
     let mut bytes = vec![0u8; len];
     r.read_exact(&mut bytes)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
@@ -65,7 +72,7 @@ fn read_f32<R: Read>(r: &mut R) -> std::io::Result<f32> {
 
 fn encode_snapshot(snap: &SystemSnapshot, out: &mut Vec<u8>) {
     out.clear();
-    out.extend_from_slice(&[0u8; 4]); // placeholder for frame byte length
+    out.extend_from_slice(&[0u8; 4]);
 
     out.extend_from_slice(&snap.cpu_total_pct.to_le_bytes());
     out.extend_from_slice(&(snap.cpu_cores_pct.len() as u32).to_le_bytes());
@@ -126,6 +133,12 @@ fn decode_snapshot<R: Read>(r: &mut R) -> std::io::Result<SystemSnapshot> {
 
     let cpu_total_pct = read_f32(r)?;
     let n_cores = read_u32(r)? as usize;
+    if n_cores > 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid core count",
+        ));
+    }
     let mut cpu_cores_pct = Vec::with_capacity(n_cores);
     for _ in 0..n_cores {
         cpu_cores_pct.push(read_f32(r)?);
@@ -133,6 +146,12 @@ fn decode_snapshot<R: Read>(r: &mut R) -> std::io::Result<SystemSnapshot> {
 
     let cpu_avg_mhz = read_u32(r)?;
     let n_freqs = read_u32(r)? as usize;
+    if n_freqs > 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid freq count",
+        ));
+    }
     let mut cpu_cores_mhz = Vec::with_capacity(n_freqs);
     for _ in 0..n_freqs {
         cpu_cores_mhz.push(read_u32(r)?);
@@ -152,6 +171,12 @@ fn decode_snapshot<R: Read>(r: &mut R) -> std::io::Result<SystemSnapshot> {
     };
 
     let n_zrams = read_u32(r)? as usize;
+    if n_zrams > 64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid zram count",
+        ));
+    }
     let mut zrams = Vec::with_capacity(n_zrams);
     for _ in 0..n_zrams {
         zrams.push(ZramMetrics {
@@ -166,6 +191,12 @@ fn decode_snapshot<R: Read>(r: &mut R) -> std::io::Result<SystemSnapshot> {
     }
 
     let n_gpus = read_u32(r)? as usize;
+    if n_gpus > 32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid gpu count",
+        ));
+    }
     let mut gpus = Vec::with_capacity(n_gpus);
     for _ in 0..n_gpus {
         gpus.push(GpuMetrics {
@@ -361,43 +392,39 @@ impl TraySharedState {
         let Ok(exe) = env::current_exe() else {
             return;
         };
-        let Ok((parent_sock, child_sock)) = UnixStream::pair() else {
+        let Ok((mut parent_sock, child_sock)) = UnixStream::pair() else {
             return;
         };
 
-        // Clear FD_CLOEXEC on child_sock so the spawned GUI worker inherits the open fd
-        let child_fd = child_sock.into_raw_fd();
+        let raw_child_fd = child_sock.as_raw_fd();
+        let mut cmd = Command::new(exe);
+        cmd.arg("--gui-worker").arg(raw_child_fd.to_string());
+
         unsafe {
-            let flags = libc_fcntl_getfd(child_fd);
-            if flags >= 0 {
-                libc_fcntl_setfd(child_fd, flags & !1); // clear FD_CLOEXEC (1)
-            }
+            cmd.pre_exec(move || {
+                let flags = fcntl(raw_child_fd, 1); // F_GETFD
+                if flags >= 0 {
+                    fcntl(raw_child_fd, 2, flags & !1); // F_SETFD without FD_CLOEXEC
+                }
+                Ok(())
+            });
         }
 
-        let mut cmd = Command::new(exe);
-        cmd.arg("--gui-worker").arg(child_fd.to_string());
-
         if let Ok(child) = cmd.spawn() {
-            // Close child fd copy in parent
-            unsafe {
-                drop(UnixStream::from_raw_fd(child_fd));
-            }
+            drop(child_sock);
 
-            // Send immediate initial snapshot frame
-            let mut stream = parent_sock;
             if let (Ok(snap), Ok(mut buf)) = (self.latest_snapshot.lock(), self.encode_buf.lock()) {
                 encode_snapshot(&snap, &mut buf);
-                let _ = stream.write_all(&buf);
+                if parent_sock.write_all(&buf).is_err() {
+                    return;
+                }
             }
-
-            let _ = stream.set_nonblocking(true);
 
             if let Ok(mut guard) = self.gui_client.lock() {
-                *guard = Some(ActiveGuiClient { child, stream });
-            }
-        } else {
-            unsafe {
-                drop(UnixStream::from_raw_fd(child_fd));
+                *guard = Some(ActiveGuiClient {
+                    child,
+                    stream: parent_sock,
+                });
             }
         }
     }
@@ -426,7 +453,6 @@ impl TraySharedState {
         cfg.save();
     }
 
-    /// Streams the latest snapshot to the GUI worker if open, and drains any interval updates sent back.
     fn push_snapshot_to_gui(&self, snap: &SystemSnapshot) {
         let Ok(mut guard) = self.gui_client.lock() else {
             return;
@@ -440,7 +466,7 @@ impl TraySharedState {
             return;
         }
 
-        // Drain any 8-byte interval updates sent by the GUI dropdown
+        let _ = client.stream.set_nonblocking(true);
         let mut ms_buf = [0u8; 8];
         while client.stream.read_exact(&mut ms_buf).is_ok() {
             let ms = u64::from_le_bytes(ms_buf);
@@ -448,34 +474,30 @@ impl TraySharedState {
                 self.interval_ms.store(ms, Ordering::Relaxed);
             }
         }
+        let _ = client.stream.set_nonblocking(false);
 
         if let Ok(mut buf) = self.encode_buf.lock() {
             encode_snapshot(snap, &mut buf);
-            let _ = client.stream.set_nonblocking(false);
             if client.stream.write_all(&buf).is_err() {
                 let _ = client.child.kill();
                 let _ = client.child.wait();
                 *guard = None;
-                return;
             }
-            let _ = client.stream.set_nonblocking(true);
         }
     }
 }
 
 unsafe extern "C" {
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    fn signal(sig: i32, handler: usize) -> usize;
 }
 
-unsafe fn libc_fcntl_getfd(fd: i32) -> i32 {
-    unsafe { fcntl(fd, 1) } // F_GETFD
+unsafe fn ignore_sigpipe() {
+    unsafe {
+        signal(13, 1); // SIGPIPE = 13, SIG_IGN = 1
+    }
 }
 
-unsafe fn libc_fcntl_setfd(fd: i32, flags: i32) -> i32 {
-    unsafe { fcntl(fd, 2, flags) } // F_SETFD
-}
-
-/// Tracks rounded visible metrics so D-Bus `tray_handle.update()` is skipped when nothing changed.
 #[derive(PartialEq, Eq, Default)]
 struct TrayVisualDigest {
     cpu_pct_tenths: u32,
@@ -798,9 +820,7 @@ impl MonitorWindowApp {
             *guard = Some(cc.egui_ctx.clone());
         }
 
-        let cached_max_line_w =
-            compute_max_line_width(&cc.egui_ctx, config.font_choice, config.font_size);
-
+        // Do NOT call ctx.fonts() here—fonts are unavailable until the first Context::run() in update().
         Self {
             state,
             config,
@@ -809,7 +829,7 @@ impl MonitorWindowApp {
             initialized_style: false,
             fit_passes_remaining: 4,
             last_fitted_size: Vec2::ZERO,
-            cached_max_line_w,
+            cached_max_line_w: 0.0,
         }
     }
 
@@ -1353,11 +1373,11 @@ impl eframe::App for MonitorWindowApp {
 fn run_gui_worker(ipc_fd: Option<i32>) -> anyhow::Result<()> {
     let config = AppConfig::load();
 
-    // If launched by the tray daemon, receive snapshots directly over the inherited UnixStream
-    // instead of opening a second HardwareCollector!
     let (initial_snapshot, ipc_stream) = if let Some(fd) = ipc_fd {
         let mut stream = unsafe { UnixStream::from_raw_fd(fd) };
-        let snap = decode_snapshot(&mut stream)?;
+        let Ok(snap) = decode_snapshot(&mut stream) else {
+            return Ok(());
+        };
         (snap, Some(stream))
     } else {
         let mut collector = HardwareCollector::new()?;
@@ -1407,7 +1427,6 @@ fn run_gui_worker(ipc_fd: Option<i32>) -> anyhow::Result<()> {
 
     let state_bg = state.clone();
     if let Some(mut reader) = ipc_reader {
-        // Event-driven socket reader: zero sysfs reads, wakes only when tray pushes a frame
         thread::spawn(move || {
             loop {
                 match decode_snapshot(&mut reader) {
@@ -1421,12 +1440,11 @@ fn run_gui_worker(ipc_fd: Option<i32>) -> anyhow::Result<()> {
                             }
                         }
                     }
-                    Err(_) => break, // Tray closed socket
+                    Err(_) => break,
                 }
             }
         });
     } else {
-        // Standalone fallback if `--gui-worker` is invoked manually without a parent tray
         thread::spawn(move || {
             let Ok(mut collector) = HardwareCollector::new() else {
                 return;
@@ -1459,12 +1477,11 @@ fn run_gui_worker(ipc_fd: Option<i32>) -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let _ = eframe::run_native(
         "KDE Rust Hardware Monitor",
         native_options,
         Box::new(move |cc| Ok(Box::new(MonitorWindowApp::new(cc, state, config)))),
-    )
-    .map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;
+    );
 
     Ok(())
 }
@@ -1516,6 +1533,10 @@ fn draw_bar(
 }
 
 fn main() -> anyhow::Result<()> {
+    unsafe {
+        ignore_sigpipe();
+    }
+
     let args: Vec<String> = env::args().collect();
     if let Some(pos) = args.iter().position(|a| a == "--gui-worker") {
         let fd = args.get(pos + 1).and_then(|s| s.parse::<i32>().ok());
@@ -1559,10 +1580,8 @@ fn main() -> anyhow::Result<()> {
                 *guard = snapshot.clone();
             }
 
-            // Stream snapshot over UnixStream if GUI window is open
             shared.push_snapshot_to_gui(&snapshot);
 
-            // Only push a D-Bus tray update if visible tray/tooltip metrics changed
             let digest = TrayVisualDigest::from_snapshot(&snapshot);
             if digest != prev_digest {
                 prev_digest = digest;
