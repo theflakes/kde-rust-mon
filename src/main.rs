@@ -280,6 +280,8 @@ struct AppConfig {
     interval_ms: u64,
     always_on_top: bool,
     show_per_core: bool,
+    window_w: f32,
+    window_h: f32,
 }
 
 impl Default for AppConfig {
@@ -290,6 +292,8 @@ impl Default for AppConfig {
             interval_ms: 1000,
             always_on_top: false,
             show_per_core: false,
+            window_w: 0.0,
+            window_h: 0.0,
         }
     }
 }
@@ -331,6 +335,20 @@ impl AppConfig {
                     }
                     "always_on_top" => cfg.always_on_top = v.trim() == "true",
                     "show_per_core" => cfg.show_per_core = v.trim() == "true",
+                    "window_w" => {
+                        if let Ok(w) = v.trim().parse::<f32>() {
+                            if w >= 200.0 && w <= 3840.0 {
+                                cfg.window_w = w;
+                            }
+                        }
+                    }
+                    "window_h" => {
+                        if let Ok(h) = v.trim().parse::<f32>() {
+                            if h >= 120.0 && h <= 2160.0 {
+                                cfg.window_h = h;
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -344,12 +362,14 @@ impl AppConfig {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "font_family={}\nfont_size={:.1}\ninterval_ms={}\nalways_on_top={}\nshow_per_core={}\n",
+            "font_family={}\nfont_size={:.1}\ninterval_ms={}\nalways_on_top={}\nshow_per_core={}\nwindow_w={:.0}\nwindow_h={:.0}\n",
             self.font_choice.as_key(),
             self.font_size,
             self.interval_ms,
             self.always_on_top,
-            self.show_per_core
+            self.show_per_core,
+            self.window_w,
+            self.window_h
         );
         let _ = fs::write(path, body);
     }
@@ -408,7 +428,6 @@ impl TraySharedState {
             return;
         };
 
-        // Send immediate initial snapshot over stdin pipe
         if let (Ok(snap), Ok(mut buf)) = (self.latest_snapshot.lock(), self.encode_buf.lock()) {
             encode_snapshot(&snap, &mut buf);
             if stdin.write_all(&buf).is_err() || stdin.flush().is_err() {
@@ -418,7 +437,6 @@ impl TraySharedState {
             }
         }
 
-        // Listen on child's stdout pipe for 8-byte polling interval updates from the GUI
         if let Some(mut stdout) = child.stdout.take() {
             let shared_ref = Arc::clone(self);
             thread::spawn(move || {
@@ -814,7 +832,7 @@ impl MonitorWindowApp {
             started_at: Instant::now(),
             post_map_fitted: false,
             initialized_style: false,
-            fit_passes_remaining: 4,
+            fit_passes_remaining: 3,
             last_fitted_size: Vec2::ZERO,
             cached_max_line_w: 0.0,
         }
@@ -823,7 +841,7 @@ impl MonitorWindowApp {
     fn trigger_auto_fit(&mut self, ctx: &egui::Context) {
         self.cached_max_line_w =
             compute_max_line_width(ctx, self.config.font_choice, self.config.font_size);
-        self.fit_passes_remaining = 4;
+        self.fit_passes_remaining = 3;
         self.last_fitted_size = Vec2::ZERO;
     }
 }
@@ -1327,9 +1345,6 @@ impl eframe::App for MonitorWindowApp {
                 });
         });
 
-        if config_dirty {
-            self.config.save();
-        }
         if layout_changed {
             self.trigger_auto_fit(ctx);
         }
@@ -1349,10 +1364,21 @@ impl eframe::App for MonitorWindowApp {
             {
                 self.last_fitted_size = target;
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
+                if (self.config.window_w - target.x).abs() > 1.0
+                    || (self.config.window_h - target.y).abs() > 1.0
+                {
+                    self.config.window_w = target.x;
+                    self.config.window_h = target.y;
+                    config_dirty = true;
+                }
             }
             ctx.request_repaint();
         } else if !self.post_map_fitted {
             ctx.request_repaint();
+        }
+
+        if config_dirty {
+            self.config.save();
         }
     }
 }
@@ -1373,30 +1399,35 @@ fn run_gui_worker(piped_mode: bool) -> anyhow::Result<()> {
         snap
     };
 
-    let scale = config.font_size / 13.0;
-    let mono_factor = if config.font_choice == FontChoice::Mono {
-        1.15
+    let (init_w, init_h) = if config.window_w > 0.0 && config.window_h > 0.0 {
+        (config.window_w, config.window_h)
     } else {
-        1.0
-    };
-    let mut est_h = 260.0;
-    if config.show_per_core && !initial_snapshot.cpu_cores_pct.is_empty() {
-        let cols = if initial_snapshot.cpu_cores_mhz.is_empty() {
-            4
+        let scale = config.font_size / 13.0;
+        let mono_factor = if config.font_choice == FontChoice::Mono {
+            1.15
         } else {
-            3
+            1.0
         };
-        let rows = initial_snapshot.cpu_cores_pct.len().div_ceil(cols);
-        est_h += rows as f32 * 24.0;
-    }
-    if initial_snapshot.mem.swap_total_mb > 0 {
-        est_h += 24.0;
-    }
-    est_h += initial_snapshot.zrams.len() as f32 * 48.0;
-    est_h += initial_snapshot.gpus.len() as f32 * 82.0;
-
-    let init_w = (480.0 * scale * mono_factor).max(360.0);
-    let init_h = (est_h * scale).max(240.0);
+        let mut est_h = 210.0;
+        if config.show_per_core && !initial_snapshot.cpu_cores_pct.is_empty() {
+            let cols = if initial_snapshot.cpu_cores_mhz.is_empty() {
+                4
+            } else {
+                3
+            };
+            let rows = initial_snapshot.cpu_cores_pct.len().div_ceil(cols);
+            est_h += rows as f32 * 22.0;
+        }
+        if initial_snapshot.mem.swap_total_mb > 0 {
+            est_h += 22.0;
+        }
+        est_h += initial_snapshot.zrams.len() as f32 * 44.0;
+        est_h += initial_snapshot.gpus.len() as f32 * 76.0;
+        (
+            (340.0 * scale * mono_factor).max(280.0),
+            (est_h * scale).max(200.0),
+        )
+    };
 
     let state = Arc::new(GuiWorkerState {
         snapshot: Mutex::new(initial_snapshot),
