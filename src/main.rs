@@ -1,6 +1,6 @@
 mod collector;
 
-use collector::{HardwareCollector, SystemSnapshot};
+use collector::{GpuMetrics, HardwareCollector, MemoryMetrics, SystemSnapshot, ZramMetrics};
 use eframe::egui::{
     self, Color32, FontData, FontDefinitions, FontFamily, FontId, ProgressBar, RichText, TextStyle,
     Vec2, ViewportBuilder, ViewportCommand, WindowLevel,
@@ -12,6 +12,9 @@ use ksni::{
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::io::{Read, Write};
+use std::os::fd::{FromRawFd, IntoRawFd};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::{
@@ -22,7 +25,180 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const POLL_INTERVALS_MS: [u64; 4] = [500, 1000, 1500, 2000];
-const IPC_INTERVAL_FILE: &str = "/tmp/kde-rust-mon-interval";
+
+// ============================================================================
+// Zero-Dependency Binary Snapshot Framing over UnixStream Socketpair
+// ============================================================================
+
+fn write_str(buf: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+fn read_str<R: Read>(r: &mut R) -> std::io::Result<String> {
+    let mut len_b = [0u8; 4];
+    r.read_exact(&mut len_b)?;
+    let len = u32::from_le_bytes(len_b) as usize;
+    let mut bytes = vec![0u8; len];
+    r.read_exact(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn read_u32<R: Read>(r: &mut R) -> std::io::Result<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(u32::from_le_bytes(b))
+}
+
+fn read_u64<R: Read>(r: &mut R) -> std::io::Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_le_bytes(b))
+}
+
+fn read_f32<R: Read>(r: &mut R) -> std::io::Result<f32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(f32::from_le_bytes(b))
+}
+
+fn encode_snapshot(snap: &SystemSnapshot, out: &mut Vec<u8>) {
+    out.clear();
+    out.extend_from_slice(&[0u8; 4]); // placeholder for frame byte length
+
+    out.extend_from_slice(&snap.cpu_total_pct.to_le_bytes());
+    out.extend_from_slice(&(snap.cpu_cores_pct.len() as u32).to_le_bytes());
+    for &p in &snap.cpu_cores_pct {
+        out.extend_from_slice(&p.to_le_bytes());
+    }
+
+    out.extend_from_slice(&snap.cpu_avg_mhz.to_le_bytes());
+    out.extend_from_slice(&(snap.cpu_cores_mhz.len() as u32).to_le_bytes());
+    for &m in &snap.cpu_cores_mhz {
+        out.extend_from_slice(&m.to_le_bytes());
+    }
+
+    out.extend_from_slice(&snap.cpu_temp_c.to_le_bytes());
+    out.extend_from_slice(&snap.cpu_power_w.to_le_bytes());
+
+    let m = &snap.mem;
+    out.extend_from_slice(&m.ram_used_mb.to_le_bytes());
+    out.extend_from_slice(&m.ram_total_mb.to_le_bytes());
+    out.extend_from_slice(&m.ram_pct.to_le_bytes());
+    out.extend_from_slice(&m.ram_speed_mts.to_le_bytes());
+    out.extend_from_slice(&m.swap_used_mb.to_le_bytes());
+    out.extend_from_slice(&m.swap_total_mb.to_le_bytes());
+    out.extend_from_slice(&m.swap_pct.to_le_bytes());
+
+    out.extend_from_slice(&(snap.zrams.len() as u32).to_le_bytes());
+    for z in &snap.zrams {
+        write_str(out, &z.name);
+        write_str(out, &z.algorithm);
+        out.extend_from_slice(&z.disksize_bytes.to_le_bytes());
+        out.extend_from_slice(&z.data_bytes.to_le_bytes());
+        out.extend_from_slice(&z.compr_bytes.to_le_bytes());
+        out.extend_from_slice(&z.total_ram_bytes.to_le_bytes());
+        out.extend_from_slice(&z.ratio.to_le_bytes());
+    }
+
+    out.extend_from_slice(&(snap.gpus.len() as u32).to_le_bytes());
+    for g in &snap.gpus {
+        write_str(out, &g.id);
+        write_str(out, &g.name);
+        out.extend_from_slice(&g.load_pct.to_le_bytes());
+        out.extend_from_slice(&g.vram_used_mb.to_le_bytes());
+        out.extend_from_slice(&g.vram_total_mb.to_le_bytes());
+        out.extend_from_slice(&g.vram_freq_mhz.to_le_bytes());
+        out.extend_from_slice(&g.vram_max_freq_mhz.to_le_bytes());
+        out.extend_from_slice(&g.temp_c.to_le_bytes());
+        out.extend_from_slice(&g.power_w.to_le_bytes());
+        out.extend_from_slice(&g.freq_mhz.to_le_bytes());
+        out.extend_from_slice(&g.max_freq_mhz.to_le_bytes());
+    }
+
+    let payload_len = (out.len() - 4) as u32;
+    out[0..4].copy_from_slice(&payload_len.to_le_bytes());
+}
+
+fn decode_snapshot<R: Read>(r: &mut R) -> std::io::Result<SystemSnapshot> {
+    let _payload_len = read_u32(r)?;
+
+    let cpu_total_pct = read_f32(r)?;
+    let n_cores = read_u32(r)? as usize;
+    let mut cpu_cores_pct = Vec::with_capacity(n_cores);
+    for _ in 0..n_cores {
+        cpu_cores_pct.push(read_f32(r)?);
+    }
+
+    let cpu_avg_mhz = read_u32(r)?;
+    let n_freqs = read_u32(r)? as usize;
+    let mut cpu_cores_mhz = Vec::with_capacity(n_freqs);
+    for _ in 0..n_freqs {
+        cpu_cores_mhz.push(read_u32(r)?);
+    }
+
+    let cpu_temp_c = read_f32(r)?;
+    let cpu_power_w = read_f32(r)?;
+
+    let mem = MemoryMetrics {
+        ram_used_mb: read_u64(r)?,
+        ram_total_mb: read_u64(r)?,
+        ram_pct: read_f32(r)?,
+        ram_speed_mts: read_u32(r)?,
+        swap_used_mb: read_u64(r)?,
+        swap_total_mb: read_u64(r)?,
+        swap_pct: read_f32(r)?,
+    };
+
+    let n_zrams = read_u32(r)? as usize;
+    let mut zrams = Vec::with_capacity(n_zrams);
+    for _ in 0..n_zrams {
+        zrams.push(ZramMetrics {
+            name: read_str(r)?,
+            algorithm: read_str(r)?,
+            disksize_bytes: read_u64(r)?,
+            data_bytes: read_u64(r)?,
+            compr_bytes: read_u64(r)?,
+            total_ram_bytes: read_u64(r)?,
+            ratio: read_f32(r)?,
+        });
+    }
+
+    let n_gpus = read_u32(r)? as usize;
+    let mut gpus = Vec::with_capacity(n_gpus);
+    for _ in 0..n_gpus {
+        gpus.push(GpuMetrics {
+            id: read_str(r)?,
+            name: read_str(r)?,
+            load_pct: read_u32(r)?,
+            vram_used_mb: read_u64(r)?,
+            vram_total_mb: read_u64(r)?,
+            vram_freq_mhz: read_u32(r)?,
+            vram_max_freq_mhz: read_u32(r)?,
+            temp_c: read_u32(r)?,
+            power_w: read_f32(r)?,
+            freq_mhz: read_u32(r)?,
+            max_freq_mhz: read_u32(r)?,
+        });
+    }
+
+    Ok(SystemSnapshot {
+        cpu_total_pct,
+        cpu_cores_pct,
+        cpu_avg_mhz,
+        cpu_cores_mhz,
+        cpu_temp_c,
+        cpu_power_w,
+        mem,
+        zrams,
+        gpus,
+    })
+}
+
+// ============================================================================
+// Configuration Persistence
+// ============================================================================
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FontChoice {
@@ -149,16 +325,27 @@ impl AppConfig {
     }
 }
 
+// ============================================================================
+// Tray Process Shared State & Dirty Tracking
+// ============================================================================
+
+struct ActiveGuiClient {
+    child: Child,
+    stream: UnixStream,
+}
+
 struct TraySharedState {
     interval_ms: AtomicU64,
-    gui_child: Mutex<Option<Child>>,
+    latest_snapshot: Mutex<SystemSnapshot>,
+    gui_client: Mutex<Option<ActiveGuiClient>>,
+    encode_buf: Mutex<Vec<u8>>,
 }
 
 impl TraySharedState {
     fn is_window_open(&self) -> bool {
-        if let Ok(mut guard) = self.gui_child.lock() {
-            if let Some(child) = guard.as_mut() {
-                if let Ok(None) = child.try_wait() {
+        if let Ok(mut guard) = self.gui_client.lock() {
+            if let Some(client) = guard.as_mut() {
+                if let Ok(None) = client.child.try_wait() {
                     return true;
                 }
                 *guard = None;
@@ -171,22 +358,55 @@ impl TraySharedState {
         if self.is_window_open() {
             return;
         }
-        if let Ok(exe) = env::current_exe() {
-            let ms = self.interval_ms.load(Ordering::Relaxed);
-            let _ = fs::write(IPC_INTERVAL_FILE, ms.to_string());
-            if let Ok(child) = Command::new(exe).arg("--gui-worker").spawn() {
-                if let Ok(mut guard) = self.gui_child.lock() {
-                    *guard = Some(child);
-                }
+        let Ok(exe) = env::current_exe() else {
+            return;
+        };
+        let Ok((parent_sock, child_sock)) = UnixStream::pair() else {
+            return;
+        };
+
+        // Clear FD_CLOEXEC on child_sock so the spawned GUI worker inherits the open fd
+        let child_fd = child_sock.into_raw_fd();
+        unsafe {
+            let flags = libc_fcntl_getfd(child_fd);
+            if flags >= 0 {
+                libc_fcntl_setfd(child_fd, flags & !1); // clear FD_CLOEXEC (1)
+            }
+        }
+
+        let mut cmd = Command::new(exe);
+        cmd.arg("--gui-worker").arg(child_fd.to_string());
+
+        if let Ok(child) = cmd.spawn() {
+            // Close child fd copy in parent
+            unsafe {
+                drop(UnixStream::from_raw_fd(child_fd));
+            }
+
+            // Send immediate initial snapshot frame
+            let mut stream = parent_sock;
+            if let (Ok(snap), Ok(mut buf)) = (self.latest_snapshot.lock(), self.encode_buf.lock()) {
+                encode_snapshot(&snap, &mut buf);
+                let _ = stream.write_all(&buf);
+            }
+
+            let _ = stream.set_nonblocking(true);
+
+            if let Ok(mut guard) = self.gui_client.lock() {
+                *guard = Some(ActiveGuiClient { child, stream });
+            }
+        } else {
+            unsafe {
+                drop(UnixStream::from_raw_fd(child_fd));
             }
         }
     }
 
     fn close_window(&self) {
-        if let Ok(mut guard) = self.gui_child.lock() {
-            if let Some(mut child) = guard.take() {
-                let _ = child.kill();
-                let _ = child.wait();
+        if let Ok(mut guard) = self.gui_client.lock() {
+            if let Some(mut client) = guard.take() {
+                let _ = client.child.kill();
+                let _ = client.child.wait();
             }
         }
     }
@@ -201,22 +421,96 @@ impl TraySharedState {
 
     fn set_interval(&self, ms: u64) {
         self.interval_ms.store(ms, Ordering::Relaxed);
-        let _ = fs::write(IPC_INTERVAL_FILE, ms.to_string());
         let mut cfg = AppConfig::load();
         cfg.interval_ms = ms;
         cfg.save();
     }
 
-    fn sync_interval_from_ipc(&self) -> u64 {
-        if let Ok(s) = fs::read_to_string(IPC_INTERVAL_FILE) {
-            if let Ok(ms) = s.trim().parse::<u64>() {
-                if POLL_INTERVALS_MS.contains(&ms) {
-                    self.interval_ms.store(ms, Ordering::Relaxed);
-                    return ms;
-                }
+    /// Streams the latest snapshot to the GUI worker if open, and drains any interval updates sent back.
+    fn push_snapshot_to_gui(&self, snap: &SystemSnapshot) {
+        let Ok(mut guard) = self.gui_client.lock() else {
+            return;
+        };
+        let Some(client) = guard.as_mut() else {
+            return;
+        };
+
+        if let Ok(Some(_)) = client.child.try_wait() {
+            *guard = None;
+            return;
+        }
+
+        // Drain any 8-byte interval updates sent by the GUI dropdown
+        let mut ms_buf = [0u8; 8];
+        while client.stream.read_exact(&mut ms_buf).is_ok() {
+            let ms = u64::from_le_bytes(ms_buf);
+            if POLL_INTERVALS_MS.contains(&ms) {
+                self.interval_ms.store(ms, Ordering::Relaxed);
             }
         }
-        self.interval_ms.load(Ordering::Relaxed)
+
+        if let Ok(mut buf) = self.encode_buf.lock() {
+            encode_snapshot(snap, &mut buf);
+            let _ = client.stream.set_nonblocking(false);
+            if client.stream.write_all(&buf).is_err() {
+                let _ = client.child.kill();
+                let _ = client.child.wait();
+                *guard = None;
+                return;
+            }
+            let _ = client.stream.set_nonblocking(true);
+        }
+    }
+}
+
+unsafe extern "C" {
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+}
+
+unsafe fn libc_fcntl_getfd(fd: i32) -> i32 {
+    unsafe { fcntl(fd, 1) } // F_GETFD
+}
+
+unsafe fn libc_fcntl_setfd(fd: i32, flags: i32) -> i32 {
+    unsafe { fcntl(fd, 2, flags) } // F_SETFD
+}
+
+/// Tracks rounded visible metrics so D-Bus `tray_handle.update()` is skipped when nothing changed.
+#[derive(PartialEq, Eq, Default)]
+struct TrayVisualDigest {
+    cpu_pct_tenths: u32,
+    cpu_avg_mhz: u32,
+    cpu_temp_tenths: u32,
+    cpu_power_tenths: u32,
+    ram_used_mb: u64,
+    swap_used_mb: u64,
+    gpu_digest: Vec<(u32, u32, u32, u64, u32, u32)>,
+}
+
+impl TrayVisualDigest {
+    fn from_snapshot(s: &SystemSnapshot) -> Self {
+        Self {
+            cpu_pct_tenths: (s.cpu_total_pct * 10.0).round() as u32,
+            cpu_avg_mhz: s.cpu_avg_mhz,
+            cpu_temp_tenths: (s.cpu_temp_c * 10.0).round() as u32,
+            cpu_power_tenths: (s.cpu_power_w * 10.0).round() as u32,
+            ram_used_mb: s.mem.ram_used_mb,
+            swap_used_mb: s.mem.swap_used_mb,
+            gpu_digest: s
+                .gpus
+                .iter()
+                .map(|g| {
+                    (
+                        g.load_pct,
+                        g.freq_mhz,
+                        g.vram_freq_mhz,
+                        g.vram_used_mb,
+                        g.temp_c,
+                        (g.power_w * 10.0).round() as u32,
+                    )
+                })
+                .collect(),
+        }
     }
 }
 
@@ -464,13 +758,14 @@ impl Tray for KdeResourceTray {
 }
 
 // ============================================================================
-// GUI Worker Window Process
+// GUI Worker Window Process (Zero-Sysfs-Poll Receiver)
 // ============================================================================
 
 struct GuiWorkerState {
     snapshot: Mutex<SystemSnapshot>,
     interval_ms: AtomicU64,
     egui_ctx: Mutex<Option<egui::Context>>,
+    ipc_writer: Option<Mutex<UnixStream>>,
 }
 
 struct MonitorWindowApp {
@@ -481,6 +776,7 @@ struct MonitorWindowApp {
     initialized_style: bool,
     fit_passes_remaining: u8,
     last_fitted_size: Vec2,
+    cached_max_line_w: f32,
 }
 
 impl MonitorWindowApp {
@@ -502,6 +798,9 @@ impl MonitorWindowApp {
             *guard = Some(cc.egui_ctx.clone());
         }
 
+        let cached_max_line_w =
+            compute_max_line_width(&cc.egui_ctx, config.font_choice, config.font_size);
+
         Self {
             state,
             config,
@@ -510,10 +809,13 @@ impl MonitorWindowApp {
             initialized_style: false,
             fit_passes_remaining: 4,
             last_fitted_size: Vec2::ZERO,
+            cached_max_line_w,
         }
     }
 
-    fn trigger_auto_fit(&mut self) {
+    fn trigger_auto_fit(&mut self, ctx: &egui::Context) {
+        self.cached_max_line_w =
+            compute_max_line_width(ctx, self.config.font_choice, self.config.font_size);
         self.fit_passes_remaining = 4;
         self.last_fitted_size = Vec2::ZERO;
     }
@@ -598,15 +900,28 @@ fn apply_font_style(ctx: &egui::Context, choice: FontChoice, base_size: f32) {
     ctx.set_style(style);
 }
 
-fn measure_text_width(ctx: &egui::Context, text: &str, choice: FontChoice, size: f32) -> f32 {
+fn compute_max_line_width(ctx: &egui::Context, choice: FontChoice, size: f32) -> f32 {
+    let sample_strings = [
+        "Data: 99.9G → Compr: 99.9G | RAM: 99.9G / 99.9G",
+        "RAM: 99.99 / 99.99 GiB (100.0%)  ",
+        "VRAM: 8176 / 8176 MiB (100%) @ 2800 / 2800 MHz",
+        "Clock Load: 100%  (3100 / 3100 MHz)  ",
+        "Unified Memory (Shared RAM @ 8533 MT/s)",
+    ];
     let font_id = FontId::new(size, choice.to_egui_family());
     ctx.fonts(|f| {
-        f.layout_no_wrap(text.to_owned(), font_id, Color32::WHITE)
-            .size()
-            .x
+        sample_strings
+            .iter()
+            .map(|&s| {
+                f.layout_no_wrap(s.to_owned(), font_id.clone(), Color32::WHITE)
+                    .size()
+                    .x
+            })
+            .fold(0.0f32, f32::max)
     })
 }
 
+#[inline]
 fn format_vram_clock(active_mhz: u32, max_mhz: u32) -> String {
     if active_mhz > 0 && max_mhz > 0 {
         format!(" @ {active_mhz} / {max_mhz} MHz")
@@ -622,13 +937,13 @@ impl eframe::App for MonitorWindowApp {
         if !self.initialized_style {
             self.initialized_style = true;
             apply_font_style(ctx, self.config.font_choice, self.config.font_size);
-            self.trigger_auto_fit();
+            self.trigger_auto_fit(ctx);
             ctx.request_repaint();
         }
 
         if !self.post_map_fitted && self.started_at.elapsed() >= Duration::from_millis(150) {
             self.post_map_fitted = true;
-            self.trigger_auto_fit();
+            self.trigger_auto_fit(ctx);
         }
 
         let snap = self
@@ -702,9 +1017,13 @@ impl eframe::App for MonitorWindowApp {
                                 self.state
                                     .interval_ms
                                     .store(cur_interval, Ordering::Relaxed);
-                                let _ = fs::write(IPC_INTERVAL_FILE, cur_interval.to_string());
                                 self.config.interval_ms = cur_interval;
                                 config_dirty = true;
+                                if let Some(ref writer) = self.state.ipc_writer {
+                                    if let Ok(mut w) = writer.lock() {
+                                        let _ = w.write_all(&cur_interval.to_le_bytes());
+                                    }
+                                }
                             }
                         }
                     });
@@ -739,18 +1058,6 @@ impl eframe::App for MonitorWindowApp {
         let top_bar_intrinsic_w = top_resp.inner;
         let top_bar_h = top_resp.response.rect.height();
 
-        let sample_strings = [
-            "Data: 99.9G → Compr: 99.9G | RAM: 99.9G / 99.9G",
-            "RAM: 99.99 / 99.99 GiB (100.0%)  ",
-            "VRAM: 8176 / 8176 MiB (100%) @ 2800 / 2800 MHz",
-            "Clock Load: 100%  (3100 / 3100 MHz)  ",
-            "Unified Memory (Shared RAM @ 8533 MT/s)",
-        ];
-        let max_line_w = sample_strings
-            .iter()
-            .map(|s| measure_text_width(ctx, s, self.config.font_choice, self.config.font_size))
-            .fold(0.0f32, f32::max);
-
         let scale = self.config.font_size / 13.0;
         let mono_boost = if self.config.font_choice == FontChoice::Mono {
             1.12
@@ -771,7 +1078,10 @@ impl eframe::App for MonitorWindowApp {
         };
 
         let group_pad = 14.0;
-        let intrinsic_bar_w = max_line_w.max(grid_w).max(top_bar_intrinsic_w - group_pad);
+        let intrinsic_bar_w = self
+            .cached_max_line_w
+            .max(grid_w)
+            .max(top_bar_intrinsic_w - group_pad);
 
         let mut content_height = 0.0f32;
 
@@ -1014,7 +1324,7 @@ impl eframe::App for MonitorWindowApp {
             self.config.save();
         }
         if layout_changed {
-            self.trigger_auto_fit();
+            self.trigger_auto_fit(ctx);
         }
 
         if self.fit_passes_remaining > 0 {
@@ -1040,17 +1350,21 @@ impl eframe::App for MonitorWindowApp {
     }
 }
 
-fn run_gui_worker() -> anyhow::Result<()> {
-    let mut collector = HardwareCollector::new()?;
-    let initial_snapshot = collector.sample()?;
+fn run_gui_worker(ipc_fd: Option<i32>) -> anyhow::Result<()> {
     let config = AppConfig::load();
 
-    let initial_ms = fs::read_to_string(IPC_INTERVAL_FILE)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|ms| POLL_INTERVALS_MS.contains(ms))
-        .unwrap_or(config.interval_ms);
-    let _ = fs::write(IPC_INTERVAL_FILE, initial_ms.to_string());
+    // If launched by the tray daemon, receive snapshots directly over the inherited UnixStream
+    // instead of opening a second HardwareCollector!
+    let (initial_snapshot, ipc_stream) = if let Some(fd) = ipc_fd {
+        let mut stream = unsafe { UnixStream::from_raw_fd(fd) };
+        let snap = decode_snapshot(&mut stream)?;
+        (snap, Some(stream))
+    } else {
+        let mut collector = HardwareCollector::new()?;
+        let mut snap = SystemSnapshot::default();
+        collector.sample_into(&mut snap)?;
+        (snap, None)
+    };
 
     let scale = config.font_size / 13.0;
     let mono_factor = if config.font_choice == FontChoice::Mono {
@@ -1077,36 +1391,63 @@ fn run_gui_worker() -> anyhow::Result<()> {
     let init_w = (480.0 * scale * mono_factor).max(360.0);
     let init_h = (est_h * scale).max(240.0);
 
+    let (ipc_reader, ipc_writer) = if let Some(stream) = ipc_stream {
+        let writer = stream.try_clone().ok().map(Mutex::new);
+        (Some(stream), writer)
+    } else {
+        (None, None)
+    };
+
     let state = Arc::new(GuiWorkerState {
         snapshot: Mutex::new(initial_snapshot),
-        interval_ms: AtomicU64::new(initial_ms),
+        interval_ms: AtomicU64::new(config.interval_ms),
         egui_ctx: Mutex::new(None),
+        ipc_writer,
     });
 
     let state_bg = state.clone();
-    thread::spawn(move || {
-        loop {
-            let sleep_ms = fs::read_to_string(IPC_INTERVAL_FILE)
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .filter(|ms| POLL_INTERVALS_MS.contains(ms))
-                .unwrap_or_else(|| state_bg.interval_ms.load(Ordering::Relaxed));
-            state_bg.interval_ms.store(sleep_ms, Ordering::Relaxed);
-
-            thread::sleep(Duration::from_millis(sleep_ms));
-
-            if let Ok(snap) = collector.sample() {
-                if let Ok(mut guard) = state_bg.snapshot.lock() {
-                    *guard = snap;
+    if let Some(mut reader) = ipc_reader {
+        // Event-driven socket reader: zero sysfs reads, wakes only when tray pushes a frame
+        thread::spawn(move || {
+            loop {
+                match decode_snapshot(&mut reader) {
+                    Ok(snap) => {
+                        if let Ok(mut guard) = state_bg.snapshot.lock() {
+                            *guard = snap;
+                        }
+                        if let Ok(guard) = state_bg.egui_ctx.lock() {
+                            if let Some(ctx) = &*guard {
+                                ctx.request_repaint();
+                            }
+                        }
+                    }
+                    Err(_) => break, // Tray closed socket
                 }
-                if let Ok(guard) = state_bg.egui_ctx.lock() {
-                    if let Some(ctx) = &*guard {
-                        ctx.request_repaint();
+            }
+        });
+    } else {
+        // Standalone fallback if `--gui-worker` is invoked manually without a parent tray
+        thread::spawn(move || {
+            let Ok(mut collector) = HardwareCollector::new() else {
+                return;
+            };
+            let mut local_snap = SystemSnapshot::default();
+            loop {
+                let sleep_ms = state_bg.interval_ms.load(Ordering::Relaxed);
+                thread::sleep(Duration::from_millis(sleep_ms));
+                if collector.sample_into(&mut local_snap).is_ok() {
+                    if let Ok(mut guard) = state_bg.snapshot.lock() {
+                        *guard = local_snap.clone();
+                    }
+                    if let Ok(guard) = state_bg.egui_ctx.lock() {
+                        if let Some(ctx) = &*guard {
+                            ctx.request_repaint();
+                        }
                     }
                 }
             }
-        }
-    });
+        });
+    }
 
     let native_options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
@@ -1128,6 +1469,7 @@ fn run_gui_worker() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[inline]
 fn format_mhz(mhz: u32) -> String {
     if mhz >= 1000 {
         format!("{:.2} GHz", mhz as f32 / 1000.0)
@@ -1136,6 +1478,7 @@ fn format_mhz(mhz: u32) -> String {
     }
 }
 
+#[inline]
 fn format_bytes(bytes: u64) -> String {
     const GIB: f64 = 1_073_741_824.0;
     const MIB: f64 = 1_048_576.0;
@@ -1173,20 +1516,25 @@ fn draw_bar(
 }
 
 fn main() -> anyhow::Result<()> {
-    if env::args().any(|a| a == "--gui-worker") {
-        return run_gui_worker();
+    let args: Vec<String> = env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--gui-worker") {
+        let fd = args.get(pos + 1).and_then(|s| s.parse::<i32>().ok());
+        return run_gui_worker(fd);
     }
 
     let mut collector = HardwareCollector::new()?;
-    let initial_snapshot = collector.sample()?;
+    let mut snapshot = SystemSnapshot::default();
+    collector.sample_into(&mut snapshot)?;
     let saved_cfg = AppConfig::load();
 
-    let start_hidden = env::args().any(|a| a == "--tray" || a == "--hidden");
-    let _ = fs::write(IPC_INTERVAL_FILE, saved_cfg.interval_ms.to_string());
+    let start_hidden = args.iter().any(|a| a == "--tray" || a == "--hidden");
+    let mut prev_digest = TrayVisualDigest::from_snapshot(&snapshot);
 
     let shared = Arc::new(TraySharedState {
         interval_ms: AtomicU64::new(saved_cfg.interval_ms),
-        gui_child: Mutex::new(None),
+        latest_snapshot: Mutex::new(snapshot.clone()),
+        gui_client: Mutex::new(None),
+        encode_buf: Mutex::new(Vec::with_capacity(1024)),
     });
 
     if !start_hidden {
@@ -1194,7 +1542,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let tray = KdeResourceTray {
-        snapshot: initial_snapshot,
+        snapshot: snapshot.clone(),
         shared: shared.clone(),
     };
 
@@ -1203,15 +1551,26 @@ fn main() -> anyhow::Result<()> {
     service.spawn();
 
     loop {
-        let sleep_ms = shared.sync_interval_from_ipc();
+        let sleep_ms = shared.interval_ms.load(Ordering::Relaxed);
         thread::sleep(Duration::from_millis(sleep_ms));
 
-        let _ = shared.is_window_open();
+        if collector.sample_into(&mut snapshot).is_ok() {
+            if let Ok(mut guard) = shared.latest_snapshot.lock() {
+                *guard = snapshot.clone();
+            }
 
-        if let Ok(snap) = collector.sample() {
-            tray_handle.update(|tray: &mut KdeResourceTray| {
-                tray.snapshot = snap;
-            });
+            // Stream snapshot over UnixStream if GUI window is open
+            shared.push_snapshot_to_gui(&snapshot);
+
+            // Only push a D-Bus tray update if visible tray/tooltip metrics changed
+            let digest = TrayVisualDigest::from_snapshot(&snapshot);
+            if digest != prev_digest {
+                prev_digest = digest;
+                let snap_for_tray = snapshot.clone();
+                tray_handle.update(|tray: &mut KdeResourceTray| {
+                    tray.snapshot = snap_for_tray;
+                });
+            }
         }
     }
 }

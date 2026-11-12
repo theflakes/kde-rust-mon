@@ -87,6 +87,7 @@ enum PowerSensor {
 }
 
 impl PowerSensor {
+    #[inline]
     fn sample_watts(&mut self, now: Instant) -> f32 {
         match self {
             PowerSensor::DirectMicrowatts(file) => read_u64_fast(file)
@@ -146,6 +147,7 @@ pub struct HardwareCollector {
     ram_speed_mts: u32,
     zram_handles: Vec<ZramHandle>,
     nvml: Option<Nvml>,
+    nvml_names: Vec<String>,
     sysfs_gpus: Vec<SysfsGpuHandle>,
 }
 
@@ -164,6 +166,20 @@ impl HardwareCollector {
         let ram_speed_mts = Self::detect_ram_speed_mts();
         let zram_handles = Self::discover_zram_devices();
         let nvml = Nvml::init().ok();
+
+        let mut nvml_names = Vec::new();
+        if let Some(ref n) = nvml {
+            let count = n.device_count().unwrap_or(0);
+            nvml_names.reserve(count as usize);
+            for i in 0..count {
+                let name = n
+                    .device_by_index(i)
+                    .and_then(|d| d.name())
+                    .unwrap_or_else(|_| format!("NVIDIA GPU {i}"));
+                nvml_names.push(name);
+            }
+        }
+
         let sysfs_gpus = Self::discover_sysfs_gpus();
 
         let mut collector = Self {
@@ -173,53 +189,49 @@ impl HardwareCollector {
             cpu_freq_files,
             stat_buf: Vec::with_capacity(8192),
             prev_cpu_total: CpuTimes::default(),
-            prev_cpu_cores: Vec::new(),
+            prev_cpu_cores: Vec::with_capacity(64),
             cpu_temp_file,
             cpu_power_sensor,
             ram_speed_mts,
             zram_handles,
             nvml,
+            nvml_names,
             sysfs_gpus,
         };
 
-        let _ = collector.sample_cpu();
+        // Prime CPU tick baseline
+        let mut prime = SystemSnapshot::default();
+        let _ = collector.sample_cpu_into(&mut prime);
         Ok(collector)
     }
 
-    pub fn sample(&mut self) -> Result<SystemSnapshot> {
+    /// Populates `snap` completely in-place without allocating new `Vec`s or `String`s on steady-state ticks.
+    pub fn sample_into(&mut self, snap: &mut SystemSnapshot) -> Result<()> {
         let now = Instant::now();
-        let (cpu_total_pct, cpu_cores_pct) = self.sample_cpu()?;
-        let (cpu_avg_mhz, cpu_cores_mhz) = self.sample_cpu_freqs();
-        let mem = self.sample_memory()?;
-        let zrams = self.sample_zram();
-        let cpu_temp_c = self
+        self.sample_cpu_into(snap)?;
+        self.sample_cpu_freqs_into(snap);
+        self.sample_memory_into(&mut snap.mem)?;
+        self.sample_zram_into(&mut snap.zrams);
+
+        snap.cpu_temp_c = self
             .cpu_temp_file
             .as_mut()
             .and_then(|f| read_u64_fast(f).ok())
             .map(|millideg| millideg as f32 / 1000.0)
             .unwrap_or(0.0);
 
-        let cpu_power_w = self
+        snap.cpu_power_w = self
             .cpu_power_sensor
             .as_mut()
             .map(|s| s.sample_watts(now))
             .unwrap_or(0.0);
 
-        let mut gpus = Vec::new();
-        self.sample_nvml_gpus(&mut gpus);
-        self.sample_sysfs_gpus(&mut gpus, now);
+        let mut gpu_idx = 0usize;
+        self.sample_nvml_gpus_into(&mut snap.gpus, &mut gpu_idx);
+        self.sample_sysfs_gpus_into(&mut snap.gpus, &mut gpu_idx, now);
+        snap.gpus.truncate(gpu_idx);
 
-        Ok(SystemSnapshot {
-            cpu_total_pct,
-            cpu_cores_pct,
-            cpu_avg_mhz,
-            cpu_cores_mhz,
-            cpu_temp_c,
-            cpu_power_w,
-            mem,
-            zrams,
-            gpus,
-        })
+        Ok(())
     }
 
     fn discover_cpu_freq_files() -> Vec<File> {
@@ -251,9 +263,10 @@ impl HardwareCollector {
             .collect()
     }
 
-    fn sample_cpu_freqs(&mut self) -> (u32, Vec<u32>) {
+    fn sample_cpu_freqs_into(&mut self, snap: &mut SystemSnapshot) {
+        snap.cpu_cores_mhz.clear();
+
         if !self.cpu_freq_files.is_empty() {
-            let mut per_core = Vec::with_capacity(self.cpu_freq_files.len());
             let mut sum_mhz = 0u64;
             let mut active_count = 0u64;
 
@@ -265,16 +278,15 @@ impl HardwareCollector {
                     sum_mhz += mhz as u64;
                     active_count += 1;
                 }
-                per_core.push(mhz);
+                snap.cpu_cores_mhz.push(mhz);
             }
 
-            let avg_mhz = if active_count > 0 {
+            snap.cpu_avg_mhz = if active_count > 0 {
                 (sum_mhz / active_count) as u32
             } else {
                 0
             };
-
-            return (avg_mhz, per_core);
+            return;
         }
 
         if let Some(file) = &mut self.proc_cpuinfo {
@@ -282,7 +294,6 @@ impl HardwareCollector {
                 self.stat_buf.clear();
                 if file.read_to_end(&mut self.stat_buf).is_ok() {
                     if let Ok(content) = std::str::from_utf8(&self.stat_buf) {
-                        let mut per_core = Vec::new();
                         let mut sum_mhz = 0u64;
                         for line in content.lines() {
                             if let Some(rest) = line.strip_prefix("cpu MHz") {
@@ -290,32 +301,31 @@ impl HardwareCollector {
                                     let mhz =
                                         val_str.trim().parse::<f32>().unwrap_or(0.0).round() as u32;
                                     sum_mhz += mhz as u64;
-                                    per_core.push(mhz);
+                                    snap.cpu_cores_mhz.push(mhz);
                                 }
                             }
                         }
-                        let avg = if !per_core.is_empty() {
-                            (sum_mhz / per_core.len() as u64) as u32
+                        snap.cpu_avg_mhz = if !snap.cpu_cores_mhz.is_empty() {
+                            (sum_mhz / snap.cpu_cores_mhz.len() as u64) as u32
                         } else {
                             0
                         };
-                        return (avg, per_core);
+                        return;
                     }
                 }
             }
         }
 
-        (0, Vec::new())
+        snap.cpu_avg_mhz = 0;
     }
 
-    fn sample_cpu(&mut self) -> Result<(f32, Vec<f32>)> {
+    fn sample_cpu_into(&mut self, snap: &mut SystemSnapshot) -> Result<()> {
         self.proc_stat.seek(SeekFrom::Start(0))?;
         self.stat_buf.clear();
         self.proc_stat.read_to_end(&mut self.stat_buf)?;
 
         let content = std::str::from_utf8(&self.stat_buf)?;
-        let mut total_pct = 0.0;
-        let mut cores_pct = Vec::with_capacity(self.prev_cpu_cores.len());
+        snap.cpu_cores_pct.clear();
         let mut core_idx = 0;
 
         for line in content.lines() {
@@ -336,25 +346,25 @@ impl HardwareCollector {
             let current = CpuTimes { active, total };
 
             if label == "cpu" {
-                total_pct = calc_cpu_delta(self.prev_cpu_total, current);
+                snap.cpu_total_pct = calc_cpu_delta(self.prev_cpu_total, current);
                 self.prev_cpu_total = current;
             } else {
                 if core_idx >= self.prev_cpu_cores.len() {
                     self.prev_cpu_cores.push(current);
-                    cores_pct.push(0.0);
+                    snap.cpu_cores_pct.push(0.0);
                 } else {
                     let pct = calc_cpu_delta(self.prev_cpu_cores[core_idx], current);
                     self.prev_cpu_cores[core_idx] = current;
-                    cores_pct.push(pct);
+                    snap.cpu_cores_pct.push(pct);
                 }
                 core_idx += 1;
             }
         }
 
-        Ok((total_pct, cores_pct))
+        Ok(())
     }
 
-    fn sample_memory(&mut self) -> Result<MemoryMetrics> {
+    fn sample_memory_into(&mut self, mem: &mut MemoryMetrics) -> Result<()> {
         self.proc_meminfo.seek(SeekFrom::Start(0))?;
         self.stat_buf.clear();
         self.proc_meminfo.read_to_end(&mut self.stat_buf)?;
@@ -388,27 +398,23 @@ impl HardwareCollector {
         let ram_used_kb = mem_total_kb.saturating_sub(mem_avail_kb);
         let swap_used_kb = swap_total_kb.saturating_sub(swap_free_kb);
 
-        let ram_pct = if mem_total_kb > 0 {
+        mem.ram_used_mb = ram_used_kb / 1024;
+        mem.ram_total_mb = mem_total_kb / 1024;
+        mem.ram_pct = if mem_total_kb > 0 {
             (ram_used_kb as f32 / mem_total_kb as f32) * 100.0
         } else {
             0.0
         };
-
-        let swap_pct = if swap_total_kb > 0 {
+        mem.ram_speed_mts = self.ram_speed_mts;
+        mem.swap_used_mb = swap_used_kb / 1024;
+        mem.swap_total_mb = swap_total_kb / 1024;
+        mem.swap_pct = if swap_total_kb > 0 {
             (swap_used_kb as f32 / swap_total_kb as f32) * 100.0
         } else {
             0.0
         };
 
-        Ok(MemoryMetrics {
-            ram_used_mb: ram_used_kb / 1024,
-            ram_total_mb: mem_total_kb / 1024,
-            ram_pct,
-            ram_speed_mts: self.ram_speed_mts,
-            swap_used_mb: swap_used_kb / 1024,
-            swap_total_mb: swap_total_kb / 1024,
-            swap_pct,
-        })
+        Ok(())
     }
 
     fn detect_ram_speed_mts() -> u32 {
@@ -510,11 +516,21 @@ impl HardwareCollector {
         zrams
     }
 
-    fn sample_zram(&mut self) -> Vec<ZramMetrics> {
-        let mut out = Vec::with_capacity(self.zram_handles.len());
-        let mut buf = [0u8; 256];
+    fn sample_zram_into(&mut self, out: &mut Vec<ZramMetrics>) {
+        if out.len() != self.zram_handles.len() {
+            out.clear();
+            for z in &self.zram_handles {
+                out.push(ZramMetrics {
+                    name: z.name.clone(),
+                    algorithm: z.algorithm.clone(),
+                    disksize_bytes: z.disksize_bytes,
+                    ..Default::default()
+                });
+            }
+        }
 
-        for z in &mut self.zram_handles {
+        let mut buf = [0u8; 256];
+        for (i, z) in self.zram_handles.iter_mut().enumerate() {
             if z.mm_stat_file.seek(SeekFrom::Start(0)).is_err() {
                 continue;
             }
@@ -545,27 +561,20 @@ impl HardwareCollector {
                 0.0
             };
 
-            out.push(ZramMetrics {
-                name: z.name.clone(),
-                algorithm: z.algorithm.clone(),
-                disksize_bytes: z.disksize_bytes,
-                data_bytes,
-                compr_bytes,
-                total_ram_bytes,
-                ratio,
-            });
+            let m = &mut out[i];
+            m.data_bytes = data_bytes;
+            m.compr_bytes = compr_bytes;
+            m.total_ram_bytes = total_ram_bytes;
+            m.ratio = ratio;
         }
-
-        out
     }
 
-    fn sample_nvml_gpus(&self, out: &mut Vec<GpuMetrics>) {
+    fn sample_nvml_gpus_into(&self, out: &mut Vec<GpuMetrics>, idx: &mut usize) {
         let Some(nvml) = &self.nvml else { return };
         let count = nvml.device_count().unwrap_or(0);
 
         for i in 0..count {
             if let Ok(dev) = nvml.device_by_index(i) {
-                let name = dev.name().unwrap_or_else(|_| format!("NVIDIA GPU {i}"));
                 let (vram_used_mb, vram_total_mb) = dev
                     .memory_info()
                     .map(|m| (m.used / 1_048_576, m.total / 1_048_576))
@@ -589,24 +598,35 @@ impl HardwareCollector {
                     dev.utilization_rates().map(|u| u.gpu).unwrap_or(0)
                 };
 
-                out.push(GpuMetrics {
-                    id: format!("nvml:{i}"),
-                    name,
-                    load_pct,
-                    vram_used_mb,
-                    vram_total_mb,
-                    vram_freq_mhz,
-                    vram_max_freq_mhz,
-                    temp_c,
-                    power_w,
-                    freq_mhz,
-                    max_freq_mhz,
-                });
+                if *idx >= out.len() {
+                    let cached_name = self
+                        .nvml_names
+                        .get(i as usize)
+                        .cloned()
+                        .unwrap_or_else(|| format!("NVIDIA GPU {i}"));
+                    out.push(GpuMetrics {
+                        id: format!("nvml:{i}"),
+                        name: cached_name,
+                        ..Default::default()
+                    });
+                }
+
+                let slot = &mut out[*idx];
+                slot.load_pct = load_pct;
+                slot.vram_used_mb = vram_used_mb;
+                slot.vram_total_mb = vram_total_mb;
+                slot.vram_freq_mhz = vram_freq_mhz;
+                slot.vram_max_freq_mhz = vram_max_freq_mhz;
+                slot.temp_c = temp_c;
+                slot.power_w = power_w;
+                slot.freq_mhz = freq_mhz;
+                slot.max_freq_mhz = max_freq_mhz;
+                *idx += 1;
             }
         }
     }
 
-    fn sample_sysfs_gpus(&mut self, out: &mut Vec<GpuMetrics>, now: Instant) {
+    fn sample_sysfs_gpus_into(&mut self, out: &mut Vec<GpuMetrics>, idx: &mut usize, now: Instant) {
         for gpu in &mut self.sysfs_gpus {
             let (freq_mhz, max_freq_mhz) = match &mut gpu.clock_sensor {
                 ClockSensor::DirectFreqFile { act_file, max_mhz } => {
@@ -655,19 +675,25 @@ impl HardwareCollector {
                 .map(|s| s.sample_watts(now))
                 .unwrap_or(0.0);
 
-            out.push(GpuMetrics {
-                id: gpu.id.clone(),
-                name: gpu.name.clone(),
-                load_pct,
-                vram_used_mb,
-                vram_total_mb: gpu.vram_total_mb,
-                vram_freq_mhz,
-                vram_max_freq_mhz,
-                temp_c,
-                power_w,
-                freq_mhz,
-                max_freq_mhz,
-            });
+            if *idx >= out.len() {
+                out.push(GpuMetrics {
+                    id: gpu.id.clone(),
+                    name: gpu.name.clone(),
+                    ..Default::default()
+                });
+            }
+
+            let slot = &mut out[*idx];
+            slot.load_pct = load_pct;
+            slot.vram_used_mb = vram_used_mb;
+            slot.vram_total_mb = gpu.vram_total_mb;
+            slot.vram_freq_mhz = vram_freq_mhz;
+            slot.vram_max_freq_mhz = vram_max_freq_mhz;
+            slot.temp_c = temp_c;
+            slot.power_w = power_w;
+            slot.freq_mhz = freq_mhz;
+            slot.max_freq_mhz = max_freq_mhz;
+            *idx += 1;
         }
     }
 
