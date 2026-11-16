@@ -418,49 +418,76 @@ impl HardwareCollector {
     }
 
     fn detect_ram_speed_mts() -> u32 {
-        let Ok(entries) = fs::read_dir("/sys/firmware/dmi/entries") else {
-            return 0;
-        };
-
-        let mut max_speed = 0u32;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if !name_str.starts_with("17-") {
-                continue;
+        // 1. Direct SMBIOS Type 17 table read (works if DMI table is user-readable)
+        if let Ok(dmi) = fs::read("/sys/firmware/dmi/tables/DMI") {
+            let mut i = 0usize;
+            let mut best_speed = 0u32;
+            while i + 4 <= dmi.len() {
+                let rec_type = dmi[i];
+                let rec_len = dmi[i + 1] as usize;
+                if rec_len < 4 || i + rec_len > dmi.len() {
+                    break;
+                }
+                // SMBIOS Type 17 (Memory Device):
+                // offset 0x15 (21) = Speed (MT/s), offset 0x20 (32) = Configured Memory Speed (MT/s)
+                if rec_type == 17 && rec_len >= 0x17 {
+                    let size_field = u16::from_le_bytes([dmi[i + 0x0C], dmi[i + 0x0D]]);
+                    if size_field != 0 && size_field != 0xFFFF {
+                        let speed = u16::from_le_bytes([dmi[i + 0x15], dmi[i + 0x16]]) as u32;
+                        let conf_speed = if rec_len >= 0x22 {
+                            u16::from_le_bytes([dmi[i + 0x20], dmi[i + 0x21]]) as u32
+                        } else {
+                            0
+                        };
+                        let active = if conf_speed > 0 && conf_speed < 65535 {
+                            conf_speed
+                        } else if speed > 0 && speed < 65535 {
+                            speed
+                        } else {
+                            0
+                        };
+                        if active > best_speed {
+                            best_speed = active;
+                        }
+                    }
+                }
+                let mut next = i + rec_len;
+                while next + 1 < dmi.len() && !(dmi[next] == 0 && dmi[next + 1] == 0) {
+                    next += 1;
+                }
+                i = next + 2;
             }
-
-            let Ok(raw) = fs::read(entry.path().join("raw")) else {
-                continue;
-            };
-
-            if raw.len() < 0x17 {
-                continue;
+            if best_speed > 0 {
+                return best_speed;
             }
-            let size = u16::from_le_bytes([raw[0x0C], raw[0x0D]]);
-            if size == 0 {
-                continue;
-            }
-
-            let nominal_speed = u16::from_le_bytes([raw[0x15], raw[0x16]]) as u32;
-            let configured_speed = if raw.len() >= 0x22 {
-                u16::from_le_bytes([raw[0x20], raw[0x21]]) as u32
-            } else {
-                0
-            };
-
-            let speed = if configured_speed > 0 && configured_speed != 0xFFFF {
-                configured_speed
-            } else if nominal_speed != 0xFFFF {
-                nominal_speed
-            } else {
-                0
-            };
-
-            max_speed = max_speed.max(speed);
         }
 
-        max_speed
+        // 2. World-readable udev DMI database fallback (/run/udev/data/+dmi:id)
+        if let Ok(udev_dmi) = fs::read_to_string("/run/udev/data/+dmi:id") {
+            let mut best_speed = 0u32;
+            for line in udev_dmi.lines() {
+                if let Some(rest) = line.strip_prefix("E:MEMORY_DEVICE_") {
+                    if let Some((_, val)) = rest.split_once("_CONFIGURED_SPEED_MTS=") {
+                        if let Ok(mts) = val.trim().parse::<u32>() {
+                            if mts > best_speed && mts < 65535 {
+                                best_speed = mts;
+                            }
+                        }
+                    } else if let Some((_, val)) = rest.split_once("_SPEED_MTS=") {
+                        if let Ok(mts) = val.trim().parse::<u32>() {
+                            if mts > best_speed && mts < 65535 {
+                                best_speed = mts;
+                            }
+                        }
+                    }
+                }
+            }
+            if best_speed > 0 {
+                return best_speed;
+            }
+        }
+
+        0
     }
 
     fn discover_zram_devices() -> Vec<ZramHandle> {
