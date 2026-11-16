@@ -1,4 +1,5 @@
-use anyhow::Result;
+#![forbid(unsafe_code)]
+
 use nvml_wrapper::Nvml;
 use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
 use std::fs::{self, File};
@@ -7,26 +8,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Clone, Debug, Default)]
-pub struct GpuMetrics {
-    pub id: String,
-    pub name: String,
-    pub load_pct: u32,
-    pub vram_used_mb: u64,
-    pub vram_total_mb: u64,
-    pub vram_freq_mhz: u32,
-    pub vram_max_freq_mhz: u32,
-    pub temp_c: u32,
-    pub power_w: f32,
-    pub freq_mhz: u32,
-    pub max_freq_mhz: u32,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
 pub struct MemoryMetrics {
     pub ram_used_mb: u64,
     pub ram_total_mb: u64,
     pub ram_pct: f32,
     pub ram_speed_mts: u32,
+    pub ram_current_mts: u32,
     pub swap_used_mb: u64,
     pub swap_total_mb: u64,
     pub swap_pct: f32,
@@ -44,6 +31,21 @@ pub struct ZramMetrics {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct GpuMetrics {
+    pub id: String,
+    pub name: String,
+    pub load_pct: u32,
+    pub vram_used_mb: u64,
+    pub vram_total_mb: u64,
+    pub vram_freq_mhz: u32,
+    pub vram_max_freq_mhz: u32,
+    pub temp_c: u32,
+    pub power_w: f32,
+    pub freq_mhz: u32,
+    pub max_freq_mhz: u32,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct SystemSnapshot {
     pub cpu_total_pct: f32,
     pub cpu_cores_pct: Vec<f32>,
@@ -58,23 +60,41 @@ pub struct SystemSnapshot {
 
 #[derive(Clone, Copy, Default)]
 struct CpuTimes {
-    active: u64,
-    total: u64,
+    user: u64,
+    nice: u64,
+    system: u64,
+    idle: u64,
+    iowait: u64,
+    irq: u64,
+    softirq: u64,
+    steal: u64,
 }
 
-enum ClockSensor {
-    DirectFreqFile {
-        act_file: File,
-        max_mhz: u32,
-    },
-    AmdDpmSclk {
-        sclk_file: File,
-        fallback_max_mhz: u32,
-    },
-}
+impl CpuTimes {
+    fn total(self) -> u64 {
+        self.user
+            .saturating_add(self.nice)
+            .saturating_add(self.system)
+            .saturating_add(self.idle)
+            .saturating_add(self.iowait)
+            .saturating_add(self.irq)
+            .saturating_add(self.softirq)
+            .saturating_add(self.steal)
+    }
 
-enum VramClockSensor {
-    AmdDpmMclk(File),
+    fn active(self) -> u64 {
+        self.total()
+            .saturating_sub(self.idle.saturating_add(self.iowait))
+    }
+
+    fn pct_since(self, prev: CpuTimes) -> f32 {
+        let total_delta = self.total().saturating_sub(prev.total());
+        if total_delta == 0 {
+            return 0.0;
+        }
+        let active_delta = self.active().saturating_sub(prev.active());
+        ((active_delta as f64 / total_delta as f64) * 100.0) as f32
+    }
 }
 
 enum PowerSensor {
@@ -87,655 +107,512 @@ enum PowerSensor {
 }
 
 impl PowerSensor {
-    #[inline]
-    fn sample_watts(&mut self, now: Instant) -> f32 {
+    fn read_watts(&mut self, buf: &mut [u8; 64]) -> f32 {
         match self {
-            PowerSensor::DirectMicrowatts(file) => read_u64_fast(file)
-                .map(|uw| uw as f32 / 1_000_000.0)
-                .unwrap_or(0.0),
+            PowerSensor::DirectMicrowatts(f) => {
+                let uw = read_u64_buf(f, buf).unwrap_or(0);
+                uw as f32 / 1_000_000.0
+            }
             PowerSensor::EnergyMicrojoules {
                 file,
                 prev_uj,
                 prev_instant,
             } => {
-                let dt = now.duration_since(*prev_instant).as_secs_f32();
-                *prev_instant = now;
-                if let Ok(cur_uj) = read_u64_fast(file) {
-                    let delta_uj = cur_uj.wrapping_sub(*prev_uj);
-                    *prev_uj = cur_uj;
-                    if dt > 0.05 {
-                        (delta_uj as f32 / 1_000_000.0) / dt
-                    } else {
-                        0.0
-                    }
+                let now = Instant::now();
+                let dt = now.duration_since(*prev_instant).as_secs_f64();
+                let cur_uj = read_u64_buf(file, buf).unwrap_or(*prev_uj);
+                let watts = if dt > 0.05 && cur_uj >= *prev_uj {
+                    ((cur_uj - *prev_uj) as f64 / 1_000_000.0 / dt) as f32
                 } else {
                     0.0
-                }
+                };
+                *prev_uj = cur_uj;
+                *prev_instant = now;
+                watts
             }
         }
     }
-}
-
-struct SysfsGpuHandle {
-    id: String,
-    name: String,
-    clock_sensor: ClockSensor,
-    vram_clock_sensor: Option<VramClockSensor>,
-    vram_used_file: Option<File>,
-    vram_total_mb: u64,
-    temp_file: Option<File>,
-    power_sensor: Option<PowerSensor>,
 }
 
 struct ZramHandle {
     name: String,
     algorithm: String,
-    disksize_bytes: u64,
+    disksize_file: File,
     mm_stat_file: File,
+}
+
+enum GpuSource {
+    AmdDrm {
+        id: String,
+        name: String,
+        busy_file: File,
+        vram_used_file: Option<File>,
+        vram_total_mb: u64,
+        sclk_file: Option<File>,
+        mclk_file: Option<File>,
+        temp_file: Option<File>,
+        power_sensor: Option<PowerSensor>,
+    },
+    IntelXe {
+        id: String,
+        name: String,
+        cur_freq_file: File,
+        max_freq_mhz: u32,
+        temp_file: Option<File>,
+        power_sensor: Option<PowerSensor>,
+    },
+    IntelI915 {
+        id: String,
+        name: String,
+        cur_freq_file: File,
+        max_freq_mhz: u32,
+        temp_file: Option<File>,
+        power_sensor: Option<PowerSensor>,
+    },
+    NvidiaNvml {
+        index: u32,
+        id: String,
+        name: String,
+    },
 }
 
 pub struct HardwareCollector {
     proc_stat: File,
     proc_meminfo: File,
-    proc_cpuinfo: Option<File>,
-    cpu_freq_files: Vec<File>,
     stat_buf: Vec<u8>,
-    prev_cpu_total: CpuTimes,
-    prev_cpu_cores: Vec<CpuTimes>,
+    mem_buf: Vec<u8>,
+    small_buf: [u8; 64],
+    dpm_buf: [u8; 256],
+    prev_total: CpuTimes,
+    prev_cores: Vec<CpuTimes>,
+    cpu_freq_files: Vec<Option<File>>,
     cpu_temp_file: Option<File>,
     cpu_power_sensor: Option<PowerSensor>,
     ram_speed_mts: u32,
-    zram_handles: Vec<ZramHandle>,
+    apu_mclk_file: Option<File>,
+    zrams: Vec<ZramHandle>,
     nvml: Option<Nvml>,
-    nvml_names: Vec<String>,
-    sysfs_gpus: Vec<SysfsGpuHandle>,
+    gpus: Vec<GpuSource>,
 }
 
 impl HardwareCollector {
-    pub fn new() -> Result<Self> {
-        let proc_stat = File::open("/proc/stat")?;
+    pub fn new() -> anyhow::Result<Self> {
+        let mut proc_stat = File::open("/proc/stat")?;
         let proc_meminfo = File::open("/proc/meminfo")?;
-        let cpu_freq_files = Self::discover_cpu_freq_files();
-        let proc_cpuinfo = if cpu_freq_files.is_empty() {
-            File::open("/proc/cpuinfo").ok()
-        } else {
-            None
-        };
+        let mut stat_buf = Vec::with_capacity(8192);
+        let mem_buf = Vec::with_capacity(4096);
+
+        let mut prev_total = CpuTimes::default();
+        let mut prev_cores = Vec::new();
+        parse_proc_stat(
+            &mut proc_stat,
+            &mut stat_buf,
+            &mut prev_total,
+            &mut prev_cores,
+        );
+
+        let cpu_freq_files = Self::open_cpu_freq_files(prev_cores.len());
         let cpu_temp_file = Self::find_cpu_temp_sensor();
         let cpu_power_sensor = Self::find_cpu_power_sensor();
-        let ram_speed_mts = Self::detect_ram_speed_mts();
-        let zram_handles = Self::discover_zram_devices();
+        let ram_speed_mts = detect_ram_speed_mts();
+        let apu_mclk_file = Self::find_apu_mclk_file();
+        let zrams = Self::discover_zram();
         let nvml = Nvml::init().ok();
+        let gpus = Self::discover_gpus(nvml.as_ref());
 
-        let mut nvml_names = Vec::new();
-        if let Some(ref n) = nvml {
-            let count = n.device_count().unwrap_or(0);
-            nvml_names.reserve(count as usize);
-            for i in 0..count {
-                let name = n
-                    .device_by_index(i)
-                    .and_then(|d| d.name())
-                    .unwrap_or_else(|_| format!("NVIDIA GPU {i}"));
-                nvml_names.push(name);
-            }
-        }
-
-        let sysfs_gpus = Self::discover_sysfs_gpus();
-
-        let mut collector = Self {
+        Ok(Self {
             proc_stat,
             proc_meminfo,
-            proc_cpuinfo,
+            stat_buf,
+            mem_buf,
+            small_buf: [0u8; 64],
+            dpm_buf: [0u8; 256],
+            prev_total,
+            prev_cores,
             cpu_freq_files,
-            stat_buf: Vec::with_capacity(8192),
-            prev_cpu_total: CpuTimes::default(),
-            prev_cpu_cores: Vec::with_capacity(64),
             cpu_temp_file,
             cpu_power_sensor,
             ram_speed_mts,
-            zram_handles,
+            apu_mclk_file,
+            zrams,
             nvml,
-            nvml_names,
-            sysfs_gpus,
-        };
-
-        // Prime CPU tick baseline
-        let mut prime = SystemSnapshot::default();
-        let _ = collector.sample_cpu_into(&mut prime);
-        Ok(collector)
+            gpus,
+        })
     }
 
-    /// Populates `snap` completely in-place without allocating new `Vec`s or `String`s on steady-state ticks.
-    pub fn sample_into(&mut self, snap: &mut SystemSnapshot) -> Result<()> {
-        let now = Instant::now();
-        self.sample_cpu_into(snap)?;
-        self.sample_cpu_freqs_into(snap);
-        self.sample_memory_into(&mut snap.mem)?;
-        self.sample_zram_into(&mut snap.zrams);
+    pub fn sample_into(&mut self, snap: &mut SystemSnapshot) -> anyhow::Result<()> {
+        // 1. CPU Utilization
+        let mut cur_total = CpuTimes::default();
+        let mut cur_cores = Vec::with_capacity(self.prev_cores.len());
+        parse_proc_stat(
+            &mut self.proc_stat,
+            &mut self.stat_buf,
+            &mut cur_total,
+            &mut cur_cores,
+        );
 
-        snap.cpu_temp_c = self
-            .cpu_temp_file
-            .as_mut()
-            .and_then(|f| read_u64_fast(f).ok())
-            .map(|millideg| millideg as f32 / 1000.0)
-            .unwrap_or(0.0);
+        snap.cpu_total_pct = cur_total.pct_since(self.prev_total);
+        snap.cpu_cores_pct.clear();
+        for (idx, &cur) in cur_cores.iter().enumerate() {
+            let prev = self.prev_cores.get(idx).copied().unwrap_or(cur);
+            snap.cpu_cores_pct.push(cur.pct_since(prev));
+        }
+        self.prev_total = cur_total;
+        self.prev_cores = cur_cores;
 
-        snap.cpu_power_w = self
-            .cpu_power_sensor
-            .as_mut()
-            .map(|s| s.sample_watts(now))
-            .unwrap_or(0.0);
-
-        let mut gpu_idx = 0usize;
-        self.sample_nvml_gpus_into(&mut snap.gpus, &mut gpu_idx);
-        self.sample_sysfs_gpus_into(&mut snap.gpus, &mut gpu_idx, now);
-        snap.gpus.truncate(gpu_idx);
-
-        Ok(())
-    }
-
-    fn discover_cpu_freq_files() -> Vec<File> {
-        let mut entries_vec: Vec<(usize, PathBuf)> = Vec::new();
-        let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") else {
-            return Vec::new();
+        // 2. CPU Core Frequencies
+        snap.cpu_cores_mhz.clear();
+        let mut freq_sum = 0u64;
+        let mut freq_count = 0u64;
+        for opt_f in &mut self.cpu_freq_files {
+            if let Some(f) = opt_f {
+                let khz = read_u64_buf(f, &mut self.small_buf).unwrap_or(0);
+                let mhz = (khz / 1000) as u32;
+                snap.cpu_cores_mhz.push(mhz);
+                if mhz > 0 {
+                    freq_sum += mhz as u64;
+                    freq_count += 1;
+                }
+            } else {
+                snap.cpu_cores_mhz.push(0);
+            }
+        }
+        snap.cpu_avg_mhz = if freq_count > 0 {
+            (freq_sum / freq_count) as u32
+        } else {
+            0
         };
 
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if let Some(num_str) = name_str.strip_prefix("cpu") {
-                if !num_str.is_empty() && num_str.bytes().all(|b| b.is_ascii_digit()) {
-                    if let Ok(idx) = num_str.parse::<usize>() {
-                        let freq_path = entry.path().join("cpufreq/scaling_cur_freq");
-                        if freq_path.exists() {
-                            entries_vec.push((idx, freq_path));
+        // 3. CPU Temp & Power
+        snap.cpu_temp_c = if let Some(ref mut f) = self.cpu_temp_file {
+            read_u64_buf(f, &mut self.small_buf).unwrap_or(0) as f32 / 1000.0
+        } else {
+            0.0
+        };
+
+        snap.cpu_power_w = if let Some(ref mut sensor) = self.cpu_power_sensor {
+            sensor.read_watts(&mut self.small_buf)
+        } else {
+            0.0
+        };
+
+        // 4. Memory & Swap
+        parse_proc_meminfo(&mut self.proc_meminfo, &mut self.mem_buf, &mut snap.mem);
+        snap.mem.ram_speed_mts = self.ram_speed_mts;
+        snap.mem.ram_current_mts = if let Some(ref mut f) = self.apu_mclk_file {
+            read_active_mclk_mts(f, &mut self.dpm_buf)
+        } else {
+            0
+        };
+
+        // 5. ZRAM Devices (in-place update)
+        if snap.zrams.len() != self.zrams.len() {
+            snap.zrams
+                .resize_with(self.zrams.len(), ZramMetrics::default);
+            for (dst, src) in snap.zrams.iter_mut().zip(self.zrams.iter()) {
+                dst.name.clone_from(&src.name);
+                dst.algorithm.clone_from(&src.algorithm);
+            }
+        }
+
+        for (dst, src) in snap.zrams.iter_mut().zip(self.zrams.iter_mut()) {
+            let disksize_bytes =
+                read_u64_buf(&mut src.disksize_file, &mut self.small_buf).unwrap_or(0);
+            let (data_bytes, compr_bytes, total_ram_bytes) =
+                read_zram_mm_stat(&mut src.mm_stat_file, &mut self.dpm_buf);
+            dst.disksize_bytes = disksize_bytes;
+            dst.data_bytes = data_bytes;
+            dst.compr_bytes = compr_bytes;
+            dst.total_ram_bytes = total_ram_bytes;
+            dst.ratio = if compr_bytes > 0 {
+                data_bytes as f32 / compr_bytes as f32
+            } else {
+                1.0
+            };
+        }
+
+        // 6. GPUs (in-place update)
+        if snap.gpus.len() != self.gpus.len() {
+            snap.gpus.resize_with(self.gpus.len(), GpuMetrics::default);
+            for (dst, src) in snap.gpus.iter_mut().zip(self.gpus.iter()) {
+                match src {
+                    GpuSource::AmdDrm { id, name, .. }
+                    | GpuSource::IntelXe { id, name, .. }
+                    | GpuSource::IntelI915 { id, name, .. }
+                    | GpuSource::NvidiaNvml { id, name, .. } => {
+                        dst.id.clone_from(id);
+                        dst.name.clone_from(name);
+                    }
+                }
+            }
+        }
+
+        for (dst, src) in snap.gpus.iter_mut().zip(self.gpus.iter_mut()) {
+            match src {
+                GpuSource::AmdDrm {
+                    busy_file,
+                    vram_used_file,
+                    vram_total_mb,
+                    sclk_file,
+                    mclk_file,
+                    temp_file,
+                    power_sensor,
+                    ..
+                } => {
+                    dst.load_pct = read_u64_buf(busy_file, &mut self.small_buf).unwrap_or(0) as u32;
+                    dst.vram_used_mb = if let Some(f) = vram_used_file {
+                        read_u64_buf(f, &mut self.small_buf).unwrap_or(0) / (1024 * 1024)
+                    } else {
+                        0
+                    };
+                    dst.vram_total_mb = *vram_total_mb;
+
+                    let (cur_sclk, max_sclk) = if let Some(f) = sclk_file {
+                        read_pp_dpm_clocks(f, &mut self.dpm_buf)
+                    } else {
+                        (0, 0)
+                    };
+                    dst.freq_mhz = cur_sclk;
+                    dst.max_freq_mhz = max_sclk;
+
+                    let (cur_mclk, max_mclk) = if let Some(f) = mclk_file {
+                        read_pp_dpm_clocks(f, &mut self.dpm_buf)
+                    } else {
+                        (0, 0)
+                    };
+                    dst.vram_freq_mhz = cur_mclk;
+                    dst.vram_max_freq_mhz = max_mclk;
+
+                    dst.temp_c = if let Some(f) = temp_file {
+                        (read_u64_buf(f, &mut self.small_buf).unwrap_or(0) / 1000) as u32
+                    } else {
+                        0
+                    };
+
+                    dst.power_w = if let Some(sensor) = power_sensor {
+                        sensor.read_watts(&mut self.small_buf)
+                    } else {
+                        0.0
+                    };
+                }
+                GpuSource::IntelXe {
+                    cur_freq_file,
+                    max_freq_mhz,
+                    temp_file,
+                    power_sensor,
+                    ..
+                }
+                | GpuSource::IntelI915 {
+                    cur_freq_file,
+                    max_freq_mhz,
+                    temp_file,
+                    power_sensor,
+                    ..
+                } => {
+                    let cur_mhz =
+                        read_u64_buf(cur_freq_file, &mut self.small_buf).unwrap_or(0) as u32;
+                    dst.freq_mhz = cur_mhz;
+                    dst.max_freq_mhz = *max_freq_mhz;
+                    dst.load_pct = if *max_freq_mhz > 0 && cur_mhz > 100 {
+                        ((cur_mhz as f32 / *max_freq_mhz as f32) * 100.0).round() as u32
+                    } else {
+                        0
+                    };
+                    dst.vram_used_mb = 0;
+                    dst.vram_total_mb = 0;
+                    dst.vram_freq_mhz = 0;
+                    dst.vram_max_freq_mhz = 0;
+                    dst.temp_c = if let Some(f) = temp_file {
+                        (read_u64_buf(f, &mut self.small_buf).unwrap_or(0) / 1000) as u32
+                    } else {
+                        0
+                    };
+                    dst.power_w = if let Some(sensor) = power_sensor {
+                        sensor.read_watts(&mut self.small_buf)
+                    } else {
+                        0.0
+                    };
+                }
+                GpuSource::NvidiaNvml { index, .. } => {
+                    if let Some(ref nvml) = self.nvml {
+                        if let Ok(dev) = nvml.device_by_index(*index) {
+                            dst.load_pct = dev.utilization_rates().map(|u| u.gpu).unwrap_or(0);
+                            if let Ok(mem) = dev.memory_info() {
+                                dst.vram_used_mb = mem.used / (1024 * 1024);
+                                dst.vram_total_mb = mem.total / (1024 * 1024);
+                            }
+                            dst.freq_mhz = dev.clock_info(Clock::Graphics).unwrap_or(0);
+                            dst.max_freq_mhz = dev.max_clock_info(Clock::Graphics).unwrap_or(0);
+                            dst.vram_freq_mhz = dev.clock_info(Clock::Memory).unwrap_or(0);
+                            dst.vram_max_freq_mhz = dev.max_clock_info(Clock::Memory).unwrap_or(0);
+                            dst.temp_c = dev.temperature(TemperatureSensor::Gpu).unwrap_or(0);
+                            dst.power_w = dev
+                                .power_usage()
+                                .map(|mw| mw as f32 / 1000.0)
+                                .unwrap_or(0.0);
                         }
                     }
                 }
             }
         }
 
-        entries_vec.sort_by_key(|(idx, _)| *idx);
+        Ok(())
+    }
 
-        entries_vec
-            .into_iter()
-            .filter_map(|(_, path)| File::open(path).ok())
+    fn open_cpu_freq_files(num_cores: usize) -> Vec<Option<File>> {
+        (0..num_cores)
+            .map(|i| {
+                let p = format!("/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_cur_freq");
+                File::open(p).ok()
+            })
             .collect()
     }
 
-    fn sample_cpu_freqs_into(&mut self, snap: &mut SystemSnapshot) {
-        snap.cpu_cores_mhz.clear();
-
-        if !self.cpu_freq_files.is_empty() {
-            let mut sum_mhz = 0u64;
-            let mut active_count = 0u64;
-
-            for file in &mut self.cpu_freq_files {
-                let mhz = read_u64_fast(file)
-                    .map(|khz| (khz / 1000) as u32)
-                    .unwrap_or(0);
-                if mhz > 0 {
-                    sum_mhz += mhz as u64;
-                    active_count += 1;
-                }
-                snap.cpu_cores_mhz.push(mhz);
-            }
-
-            snap.cpu_avg_mhz = if active_count > 0 {
-                (sum_mhz / active_count) as u32
-            } else {
-                0
+    fn find_cpu_temp_sensor() -> Option<File> {
+        let entries = fs::read_dir("/sys/class/hwmon").ok()?;
+        let mut fallback = None;
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let Ok(name) = fs::read_to_string(p.join("name")) else {
+                continue;
             };
-            return;
-        }
-
-        if let Some(file) = &mut self.proc_cpuinfo {
-            if file.seek(SeekFrom::Start(0)).is_ok() {
-                self.stat_buf.clear();
-                if file.read_to_end(&mut self.stat_buf).is_ok() {
-                    if let Ok(content) = std::str::from_utf8(&self.stat_buf) {
-                        let mut sum_mhz = 0u64;
-                        for line in content.lines() {
-                            if let Some(rest) = line.strip_prefix("cpu MHz") {
-                                if let Some((_, val_str)) = rest.split_once(':') {
-                                    let mhz =
-                                        val_str.trim().parse::<f32>().unwrap_or(0.0).round() as u32;
-                                    sum_mhz += mhz as u64;
-                                    snap.cpu_cores_mhz.push(mhz);
-                                }
-                            }
-                        }
-                        snap.cpu_avg_mhz = if !snap.cpu_cores_mhz.is_empty() {
-                            (sum_mhz / snap.cpu_cores_mhz.len() as u64) as u32
-                        } else {
-                            0
-                        };
-                        return;
-                    }
+            let n = name.trim();
+            if n == "k10temp" || n == "zenpower" || n == "coretemp" {
+                if let Ok(f) = File::open(p.join("temp1_input")) {
+                    return Some(f);
                 }
+            } else if (n == "acpitz" || n == "thinkpad" || n == "dell_smm") && fallback.is_none() {
+                fallback = File::open(p.join("temp1_input")).ok();
             }
         }
-
-        snap.cpu_avg_mhz = 0;
+        fallback
     }
 
-    fn sample_cpu_into(&mut self, snap: &mut SystemSnapshot) -> Result<()> {
-        self.proc_stat.seek(SeekFrom::Start(0))?;
-        self.stat_buf.clear();
-        self.proc_stat.read_to_end(&mut self.stat_buf)?;
-
-        let content = std::str::from_utf8(&self.stat_buf)?;
-        snap.cpu_cores_pct.clear();
-        let mut core_idx = 0;
-
-        for line in content.lines() {
-            if !line.starts_with("cpu") {
-                break;
-            }
-            let mut parts = line.split_ascii_whitespace();
-            let label = parts.next().unwrap_or("");
-
-            let mut vals = [0u64; 10];
-            for (i, part) in parts.take(10).enumerate() {
-                vals[i] = part.parse().unwrap_or(0);
-            }
-
-            let active = vals[0] + vals[1] + vals[2] + vals[5] + vals[6] + vals[7];
-            let idle = vals[3] + vals[4];
-            let total = active + idle;
-            let current = CpuTimes { active, total };
-
-            if label == "cpu" {
-                snap.cpu_total_pct = calc_cpu_delta(self.prev_cpu_total, current);
-                self.prev_cpu_total = current;
-            } else {
-                if core_idx >= self.prev_cpu_cores.len() {
-                    self.prev_cpu_cores.push(current);
-                    snap.cpu_cores_pct.push(0.0);
-                } else {
-                    let pct = calc_cpu_delta(self.prev_cpu_cores[core_idx], current);
-                    self.prev_cpu_cores[core_idx] = current;
-                    snap.cpu_cores_pct.push(pct);
-                }
-                core_idx += 1;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn sample_memory_into(&mut self, mem: &mut MemoryMetrics) -> Result<()> {
-        self.proc_meminfo.seek(SeekFrom::Start(0))?;
-        self.stat_buf.clear();
-        self.proc_meminfo.read_to_end(&mut self.stat_buf)?;
-
-        let content = std::str::from_utf8(&self.stat_buf)?;
-        let mut mem_total_kb = 0u64;
-        let mut mem_avail_kb = 0u64;
-        let mut swap_total_kb = 0u64;
-        let mut swap_free_kb = 0u64;
-        let mut found = 0u8;
-
-        for line in content.lines() {
-            if let Some(rest) = line.strip_prefix("MemTotal:") {
-                mem_total_kb = parse_kb(rest);
-                found |= 1;
-            } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                mem_avail_kb = parse_kb(rest);
-                found |= 2;
-            } else if let Some(rest) = line.strip_prefix("SwapTotal:") {
-                swap_total_kb = parse_kb(rest);
-                found |= 4;
-            } else if let Some(rest) = line.strip_prefix("SwapFree:") {
-                swap_free_kb = parse_kb(rest);
-                found |= 8;
-            }
-            if found == 0b1111 {
-                break;
-            }
-        }
-
-        let ram_used_kb = mem_total_kb.saturating_sub(mem_avail_kb);
-        let swap_used_kb = swap_total_kb.saturating_sub(swap_free_kb);
-
-        mem.ram_used_mb = ram_used_kb / 1024;
-        mem.ram_total_mb = mem_total_kb / 1024;
-        mem.ram_pct = if mem_total_kb > 0 {
-            (ram_used_kb as f32 / mem_total_kb as f32) * 100.0
-        } else {
-            0.0
-        };
-        mem.ram_speed_mts = self.ram_speed_mts;
-        mem.swap_used_mb = swap_used_kb / 1024;
-        mem.swap_total_mb = swap_total_kb / 1024;
-        mem.swap_pct = if swap_total_kb > 0 {
-            (swap_used_kb as f32 / swap_total_kb as f32) * 100.0
-        } else {
-            0.0
-        };
-
-        Ok(())
-    }
-
-    fn detect_ram_speed_mts() -> u32 {
-        // 1. Direct SMBIOS Type 17 table read (works if DMI table is user-readable)
-        if let Ok(dmi) = fs::read("/sys/firmware/dmi/tables/DMI") {
-            let mut i = 0usize;
-            let mut best_speed = 0u32;
-            while i + 4 <= dmi.len() {
-                let rec_type = dmi[i];
-                let rec_len = dmi[i + 1] as usize;
-                if rec_len < 4 || i + rec_len > dmi.len() {
-                    break;
-                }
-                // SMBIOS Type 17 (Memory Device):
-                // offset 0x15 (21) = Speed (MT/s), offset 0x20 (32) = Configured Memory Speed (MT/s)
-                if rec_type == 17 && rec_len >= 0x17 {
-                    let size_field = u16::from_le_bytes([dmi[i + 0x0C], dmi[i + 0x0D]]);
-                    if size_field != 0 && size_field != 0xFFFF {
-                        let speed = u16::from_le_bytes([dmi[i + 0x15], dmi[i + 0x16]]) as u32;
-                        let conf_speed = if rec_len >= 0x22 {
-                            u16::from_le_bytes([dmi[i + 0x20], dmi[i + 0x21]]) as u32
-                        } else {
-                            0
-                        };
-                        let active = if conf_speed > 0 && conf_speed < 65535 {
-                            conf_speed
-                        } else if speed > 0 && speed < 65535 {
-                            speed
-                        } else {
-                            0
-                        };
-                        if active > best_speed {
-                            best_speed = active;
+    fn find_cpu_power_sensor() -> Option<PowerSensor> {
+        if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Ok(name) = fs::read_to_string(path.join("name")) {
+                    let n = name.trim();
+                    if n == "k10temp" || n == "zenpower" || n == "coretemp" {
+                        if let Ok(f) = File::open(path.join("power1_average"))
+                            .or_else(|_| File::open(path.join("power1_input")))
+                        {
+                            return Some(PowerSensor::DirectMicrowatts(f));
                         }
-                    }
-                }
-                let mut next = i + rec_len;
-                while next + 1 < dmi.len() && !(dmi[next] == 0 && dmi[next + 1] == 0) {
-                    next += 1;
-                }
-                i = next + 2;
-            }
-            if best_speed > 0 {
-                return best_speed;
-            }
-        }
-
-        // 2. World-readable udev DMI database fallback (/run/udev/data/+dmi:id)
-        if let Ok(udev_dmi) = fs::read_to_string("/run/udev/data/+dmi:id") {
-            let mut best_speed = 0u32;
-            for line in udev_dmi.lines() {
-                if let Some(rest) = line.strip_prefix("E:MEMORY_DEVICE_") {
-                    if let Some((_, val)) = rest.split_once("_CONFIGURED_SPEED_MTS=") {
-                        if let Ok(mts) = val.trim().parse::<u32>() {
-                            if mts > best_speed && mts < 65535 {
-                                best_speed = mts;
-                            }
-                        }
-                    } else if let Some((_, val)) = rest.split_once("_SPEED_MTS=") {
-                        if let Ok(mts) = val.trim().parse::<u32>() {
-                            if mts > best_speed && mts < 65535 {
-                                best_speed = mts;
-                            }
+                        if let Ok(mut f) = File::open(path.join("energy1_input")) {
+                            let prev_uj = read_u64_fast(&mut f).unwrap_or(0);
+                            return Some(PowerSensor::EnergyMicrojoules {
+                                file: f,
+                                prev_uj,
+                                prev_instant: Instant::now(),
+                            });
                         }
                     }
                 }
             }
-            if best_speed > 0 {
-                return best_speed;
-            }
         }
 
-        0
+        let mut f = File::open("/sys/class/powercap/intel-rapl:0/energy_uj").ok()?;
+        let prev_uj = read_u64_fast(&mut f).unwrap_or(0);
+        Some(PowerSensor::EnergyMicrojoules {
+            file: f,
+            prev_uj,
+            prev_instant: Instant::now(),
+        })
     }
 
-    fn discover_zram_devices() -> Vec<ZramHandle> {
-        let mut zrams = Vec::new();
+    fn find_apu_mclk_file() -> Option<File> {
+        let entries = fs::read_dir("/sys/class/drm").ok()?;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let s = name.to_string_lossy();
+            if !s.starts_with("card") || s.contains('-') {
+                continue;
+            }
+            let dev = entry.path().join("device");
+            let vendor = fs::read_to_string(dev.join("vendor")).unwrap_or_default();
+            let class = fs::read_to_string(dev.join("class")).unwrap_or_default();
+            if vendor.trim() == "0x1002" && class.trim().starts_with("0x0380") {
+                if let Ok(f) = File::open(dev.join("pp_dpm_mclk")) {
+                    return Some(f);
+                }
+            }
+        }
+        None
+    }
+
+    fn discover_zram() -> Vec<ZramHandle> {
+        let mut list = Vec::new();
         let Ok(entries) = fs::read_dir("/sys/block") else {
-            return zrams;
+            return list;
         };
-
-        let mut paths: Vec<PathBuf> = entries
+        let mut names: Vec<String> = entries
             .flatten()
             .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.starts_with("zram") {
-                    Some(e.path())
-                } else {
-                    None
-                }
+                let s = e.file_name().to_string_lossy().into_owned();
+                if s.starts_with("zram") { Some(s) } else { None }
             })
             .collect();
-        paths.sort();
+        names.sort();
 
-        for path in paths {
-            let disksize_bytes = fs::read_to_string(path.join("disksize"))
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(0);
-
-            if disksize_bytes == 0 {
-                continue;
-            }
-
-            let Ok(mm_stat_file) = File::open(path.join("mm_stat")) else {
+        for name in names {
+            let base = PathBuf::from("/sys/block").join(&name);
+            let Ok(mut disksize_file) = File::open(base.join("disksize")) else {
                 continue;
             };
+            if read_u64_fast(&mut disksize_file).unwrap_or(0) == 0 {
+                continue;
+            }
+            let Ok(mm_stat_file) = File::open(base.join("mm_stat")) else {
+                continue;
+            };
+            let algorithm = fs::read_to_string(base.join("comp_algorithm"))
+                .ok()
+                .and_then(|s| {
+                    s.split_whitespace()
+                        .find(|tok| tok.starts_with('[') && tok.ends_with(']'))
+                        .map(|tok| tok.trim_matches(&['[', ']'][..]).to_string())
+                })
+                .unwrap_or_else(|| "zstd".to_string());
 
-            let raw_algo = fs::read_to_string(path.join("comp_algorithm")).unwrap_or_default();
-            let algorithm = parse_bracketed_algo(&raw_algo);
-
-            let name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-
-            zrams.push(ZramHandle {
+            list.push(ZramHandle {
                 name,
                 algorithm,
-                disksize_bytes,
+                disksize_file,
                 mm_stat_file,
             });
         }
-
-        zrams
+        list
     }
 
-    fn sample_zram_into(&mut self, out: &mut Vec<ZramMetrics>) {
-        if out.len() != self.zram_handles.len() {
-            out.clear();
-            for z in &self.zram_handles {
-                out.push(ZramMetrics {
-                    name: z.name.clone(),
-                    algorithm: z.algorithm.clone(),
-                    disksize_bytes: z.disksize_bytes,
-                    ..Default::default()
-                });
-            }
-        }
-
-        let mut buf = [0u8; 256];
-        for (i, z) in self.zram_handles.iter_mut().enumerate() {
-            if z.mm_stat_file.seek(SeekFrom::Start(0)).is_err() {
-                continue;
-            }
-            let Ok(n) = z.mm_stat_file.read(&mut buf) else {
-                continue;
-            };
-            let Ok(s) = std::str::from_utf8(&buf[..n]) else {
-                continue;
-            };
-
-            let mut parts = s.split_ascii_whitespace();
-            let data_bytes = parts
-                .next()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0);
-            let compr_bytes = parts
-                .next()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0);
-            let total_ram_bytes = parts
-                .next()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0);
-
-            let ratio = if compr_bytes > 0 {
-                data_bytes as f32 / compr_bytes as f32
-            } else {
-                0.0
-            };
-
-            let m = &mut out[i];
-            m.data_bytes = data_bytes;
-            m.compr_bytes = compr_bytes;
-            m.total_ram_bytes = total_ram_bytes;
-            m.ratio = ratio;
-        }
-    }
-
-    fn sample_nvml_gpus_into(&self, out: &mut Vec<GpuMetrics>, idx: &mut usize) {
-        let Some(nvml) = &self.nvml else { return };
-        let count = nvml.device_count().unwrap_or(0);
-
-        for i in 0..count {
-            if let Ok(dev) = nvml.device_by_index(i) {
-                let (vram_used_mb, vram_total_mb) = dev
-                    .memory_info()
-                    .map(|m| (m.used / 1_048_576, m.total / 1_048_576))
-                    .unwrap_or((0, 0));
-                let temp_c = dev.temperature(TemperatureSensor::Gpu).unwrap_or(0);
-                let power_w = dev
-                    .power_usage()
-                    .map(|mw| mw as f32 / 1000.0)
-                    .unwrap_or(0.0);
-
-                let freq_mhz = dev.clock_info(Clock::Graphics).unwrap_or(0);
-                let max_freq_mhz = dev.max_clock_info(Clock::Graphics).unwrap_or(0);
-                let vram_freq_mhz = dev.clock_info(Clock::Memory).unwrap_or(0);
-                let vram_max_freq_mhz = dev.max_clock_info(Clock::Memory).unwrap_or(0);
-
-                let load_pct = if max_freq_mhz > 0 {
-                    ((freq_mhz as f32 / max_freq_mhz as f32) * 100.0)
-                        .round()
-                        .clamp(0.0, 100.0) as u32
-                } else {
-                    dev.utilization_rates().map(|u| u.gpu).unwrap_or(0)
-                };
-
-                if *idx >= out.len() {
-                    let cached_name = self
-                        .nvml_names
-                        .get(i as usize)
-                        .cloned()
-                        .unwrap_or_else(|| format!("NVIDIA GPU {i}"));
-                    out.push(GpuMetrics {
-                        id: format!("nvml:{i}"),
-                        name: cached_name,
-                        ..Default::default()
-                    });
-                }
-
-                let slot = &mut out[*idx];
-                slot.load_pct = load_pct;
-                slot.vram_used_mb = vram_used_mb;
-                slot.vram_total_mb = vram_total_mb;
-                slot.vram_freq_mhz = vram_freq_mhz;
-                slot.vram_max_freq_mhz = vram_max_freq_mhz;
-                slot.temp_c = temp_c;
-                slot.power_w = power_w;
-                slot.freq_mhz = freq_mhz;
-                slot.max_freq_mhz = max_freq_mhz;
-                *idx += 1;
-            }
-        }
-    }
-
-    fn sample_sysfs_gpus_into(&mut self, out: &mut Vec<GpuMetrics>, idx: &mut usize, now: Instant) {
-        for gpu in &mut self.sysfs_gpus {
-            let (freq_mhz, max_freq_mhz) = match &mut gpu.clock_sensor {
-                ClockSensor::DirectFreqFile { act_file, max_mhz } => {
-                    let act = read_u64_fast(act_file).unwrap_or(0) as u32;
-                    (act, *max_mhz)
-                }
-                ClockSensor::AmdDpmSclk {
-                    sclk_file,
-                    fallback_max_mhz,
-                } => {
-                    let (act, max) = parse_amd_dpm_clock(sclk_file);
-                    (act, if max > 0 { max } else { *fallback_max_mhz })
-                }
-            };
-
-            let load_pct = if max_freq_mhz > 0 {
-                ((freq_mhz as f32 / max_freq_mhz as f32) * 100.0)
-                    .round()
-                    .clamp(0.0, 100.0) as u32
-            } else {
-                0
-            };
-
-            let (vram_freq_mhz, vram_max_freq_mhz) = match &mut gpu.vram_clock_sensor {
-                Some(VramClockSensor::AmdDpmMclk(mclk_file)) => parse_amd_dpm_clock(mclk_file),
-                None => (0, 0),
-            };
-
-            let vram_used_mb = gpu
-                .vram_used_file
-                .as_mut()
-                .and_then(|f| read_u64_fast(f).ok())
-                .map(|b| b / 1_048_576)
-                .unwrap_or(0);
-
-            let temp_c = gpu
-                .temp_file
-                .as_mut()
-                .and_then(|f| read_u64_fast(f).ok())
-                .map(|m| (m / 1000) as u32)
-                .unwrap_or(0);
-
-            let power_w = gpu
-                .power_sensor
-                .as_mut()
-                .map(|s| s.sample_watts(now))
-                .unwrap_or(0.0);
-
-            if *idx >= out.len() {
-                out.push(GpuMetrics {
-                    id: gpu.id.clone(),
-                    name: gpu.name.clone(),
-                    ..Default::default()
-                });
-            }
-
-            let slot = &mut out[*idx];
-            slot.load_pct = load_pct;
-            slot.vram_used_mb = vram_used_mb;
-            slot.vram_total_mb = gpu.vram_total_mb;
-            slot.vram_freq_mhz = vram_freq_mhz;
-            slot.vram_max_freq_mhz = vram_max_freq_mhz;
-            slot.temp_c = temp_c;
-            slot.power_w = power_w;
-            slot.freq_mhz = freq_mhz;
-            slot.max_freq_mhz = max_freq_mhz;
-            *idx += 1;
-        }
-    }
-
-    fn discover_sysfs_gpus() -> Vec<SysfsGpuHandle> {
+    fn discover_gpus(nvml: Option<&Nvml>) -> Vec<GpuSource> {
         let mut gpus = Vec::new();
+
+        if let Some(nvml) = nvml {
+            if let Ok(count) = nvml.device_count() {
+                for idx in 0..count {
+                    if let Ok(dev) = nvml.device_by_index(idx) {
+                        let name = dev.name().unwrap_or_else(|_| format!("NVIDIA GPU {idx}"));
+                        gpus.push(GpuSource::NvidiaNvml {
+                            index: idx,
+                            id: format!("nvml:{idx}"),
+                            name,
+                        });
+                    }
+                }
+            }
+        }
+
         let Ok(entries) = fs::read_dir("/sys/class/drm") else {
             return gpus;
         };
-
-        let mut cards: Vec<PathBuf> = entries
+        let mut cards: Vec<String> = entries
             .flatten()
             .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.starts_with("card") && !name.contains('-') {
-                    Some(e.path())
+                let s = e.file_name().to_string_lossy().into_owned();
+                if s.starts_with("card") && !s.contains('-') {
+                    Some(s)
                 } else {
                     None
                 }
@@ -743,112 +620,104 @@ impl HardwareCollector {
             .collect();
         cards.sort();
 
-        for card_path in cards {
-            let card_name = card_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-            let dev_dir = card_path.join("device");
-
+        for card in cards {
+            let dev_dir = PathBuf::from("/sys/class/drm").join(&card).join("device");
             let vendor = fs::read_to_string(dev_dir.join("vendor"))
                 .unwrap_or_default()
                 .trim()
-                .to_lowercase();
+                .to_string();
+            let dev_id = fs::read_to_string(dev_dir.join("device"))
+                .unwrap_or_default()
+                .trim()
+                .trim_start_matches("0x")
+                .to_string();
 
-            if vendor == "0x10de" {
+            if vendor == "0x10de" && !gpus.is_empty() {
                 continue;
             }
 
-            let Some(clock_sensor) = Self::find_clock_sensor(&card_path, &dev_dir) else {
-                continue;
-            };
-
-            let vram_clock_sensor = File::open(dev_dir.join("pp_dpm_mclk"))
-                .ok()
-                .map(VramClockSensor::AmdDpmMclk);
-
-            let vram_total_mb = fs::read_to_string(dev_dir.join("mem_info_vram_total"))
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .map(|b| b / 1_048_576)
-                .unwrap_or(0);
-
-            let (temp_file, power_sensor) = Self::find_hwmon_sensors(&dev_dir, &vendor);
-            let friendly_name = Self::resolve_gpu_name(&dev_dir, &vendor, &card_name);
-
-            gpus.push(SysfsGpuHandle {
-                id: card_name,
-                name: friendly_name,
-                clock_sensor,
-                vram_clock_sensor,
-                vram_used_file: File::open(dev_dir.join("mem_info_vram_used")).ok(),
-                vram_total_mb,
-                temp_file,
-                power_sensor,
-            });
-        }
-        gpus
-    }
-
-    fn find_clock_sensor(card_path: &Path, dev_dir: &Path) -> Option<ClockSensor> {
-        let xe_freq_dir = dev_dir.join("tile0/gt0/freq0");
-        if let Ok(act_file) = File::open(xe_freq_dir.join("act_freq")) {
-            let max_mhz = ["max_freq", "rp0_freq", "rpe_freq"]
-                .iter()
-                .find_map(|name| {
-                    fs::read_to_string(xe_freq_dir.join(name))
+            if vendor == "0x1002" {
+                if let Ok(busy_file) = File::open(dev_dir.join("gpu_busy_percent")) {
+                    let vram_used_file = File::open(dev_dir.join("mem_info_vram_used")).ok();
+                    let vram_total_mb = File::open(dev_dir.join("mem_info_vram_total"))
                         .ok()
-                        .and_then(|s| s.trim().parse::<u32>().ok())
-                        .filter(|&v| v > 0)
-                })
-                .unwrap_or(0);
-            return Some(ClockSensor::DirectFreqFile { act_file, max_mhz });
+                        .and_then(|mut f| read_u64_fast(&mut f))
+                        .unwrap_or(0)
+                        / (1024 * 1024);
+                    let sclk_file = File::open(dev_dir.join("pp_dpm_sclk")).ok();
+                    let mclk_file = File::open(dev_dir.join("pp_dpm_mclk")).ok();
+                    let (temp_file, power_sensor) = Self::find_hwmon_sensors(&dev_dir, &vendor);
+                    let name = if dev_id.is_empty() {
+                        format!("AMD Radeon ({card})")
+                    } else {
+                        format!("AMD Radeon ({dev_id})")
+                    };
+                    gpus.push(GpuSource::AmdDrm {
+                        id: card,
+                        name,
+                        busy_file,
+                        vram_used_file,
+                        vram_total_mb,
+                        sclk_file,
+                        mclk_file,
+                        temp_file,
+                        power_sensor,
+                    });
+                }
+            } else if vendor == "0x8086" {
+                let xe_cur = dev_dir.join("tile0/gt0/freq0/act_freq");
+                let xe_max = dev_dir.join("tile0/gt0/freq0/max_freq");
+                if let Ok(cur_freq_file) = File::open(&xe_cur) {
+                    let max_freq_mhz = File::open(&xe_max)
+                        .ok()
+                        .and_then(|mut f| read_u64_fast(&mut f))
+                        .unwrap_or(2500) as u32;
+                    let (temp_file, power_sensor) = Self::find_hwmon_sensors(&dev_dir, &vendor);
+                    let name = if dev_id.is_empty() {
+                        format!("Intel Xe ({card})")
+                    } else {
+                        format!("Intel Xe ({dev_id})")
+                    };
+                    gpus.push(GpuSource::IntelXe {
+                        id: card,
+                        name,
+                        cur_freq_file,
+                        max_freq_mhz,
+                        temp_file,
+                        power_sensor,
+                    });
+                } else {
+                    let i915_cur = PathBuf::from("/sys/class/drm")
+                        .join(&card)
+                        .join("gt_act_freq_mhz");
+                    let i915_max = PathBuf::from("/sys/class/drm")
+                        .join(&card)
+                        .join("gt_max_freq_mhz");
+                    if let Ok(cur_freq_file) = File::open(&i915_cur) {
+                        let max_freq_mhz = File::open(&i915_max)
+                            .ok()
+                            .and_then(|mut f| read_u64_fast(&mut f))
+                            .unwrap_or(1500) as u32;
+                        let (temp_file, power_sensor) = Self::find_hwmon_sensors(&dev_dir, &vendor);
+                        let name = if dev_id.is_empty() {
+                            format!("Intel Graphics ({card})")
+                        } else {
+                            format!("Intel Graphics ({dev_id})")
+                        };
+                        gpus.push(GpuSource::IntelI915 {
+                            id: card,
+                            name,
+                            cur_freq_file,
+                            max_freq_mhz,
+                            temp_file,
+                            power_sensor,
+                        });
+                    }
+                }
+            }
         }
 
-        if let Ok(act_file) = File::open(card_path.join("gt/gt0/rps_act_freq_mhz"))
-            .or_else(|_| File::open(card_path.join("gt_act_freq_mhz")))
-        {
-            let max_mhz = [
-                card_path.join("gt/gt0/rps_max_freq_mhz"),
-                card_path.join("gt/gt0/rps_RP0_freq_mhz"),
-                card_path.join("gt_max_freq_mhz"),
-                card_path.join("gt_RP0_freq_mhz"),
-            ]
-            .iter()
-            .find_map(|p| {
-                fs::read_to_string(p)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok())
-                    .filter(|&v| v > 0)
-            })
-            .unwrap_or(0);
-            return Some(ClockSensor::DirectFreqFile { act_file, max_mhz });
-        }
-
-        if let Ok(sclk_file) = File::open(dev_dir.join("pp_dpm_sclk")) {
-            return Some(ClockSensor::AmdDpmSclk {
-                sclk_file,
-                fallback_max_mhz: 0,
-            });
-        }
-
-        None
-    }
-
-    fn resolve_gpu_name(dev_dir: &Path, vendor: &str, card_name: &str) -> String {
-        let device_id = fs::read_to_string(dev_dir.join("device"))
-            .unwrap_or_default()
-            .trim()
-            .trim_start_matches("0x")
-            .to_lowercase();
-
-        if vendor == "0x8086" {
-            return format!("Intel Xe ({device_id})");
-        } else if vendor == "0x1002" {
-            return format!("AMD Radeon ({card_name})");
-        }
-        format!("DRM {}", card_name.to_uppercase())
+        gpus
     }
 
     fn find_hwmon_sensors(dev_dir: &Path, vendor: &str) -> (Option<File>, Option<PowerSensor>) {
@@ -883,81 +752,28 @@ impl HardwareCollector {
 
         if vendor == "0x8086" {
             let temp = Self::find_cpu_temp_sensor();
-            let power = Self::find_intel_rapl_sensor(true);
+            let power = Self::find_intel_igpu_rapl_sensor();
             return (temp, power);
         }
 
         (None, None)
     }
 
-    fn find_cpu_power_sensor() -> Option<PowerSensor> {
-        if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Ok(name) = fs::read_to_string(path.join("name")) {
-                    let n = name.trim();
-                    if n == "k10temp" || n == "zenpower" || n == "coretemp" {
-                        if let Ok(f) = File::open(path.join("power1_average"))
-                            .or_else(|_| File::open(path.join("power1_input")))
-                        {
-                            return Some(PowerSensor::DirectMicrowatts(f));
-                        }
-                        if let Ok(mut f) = File::open(path.join("energy1_input")) {
-                            let prev_uj = read_u64_fast(&mut f).unwrap_or(0);
-                            return Some(PowerSensor::EnergyMicrojoules {
-                                file: f,
-                                prev_uj,
-                                prev_instant: Instant::now(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        Self::find_intel_rapl_sensor(false)
-    }
-
-    fn find_intel_rapl_sensor(prefer_uncore: bool) -> Option<PowerSensor> {
+    fn find_intel_igpu_rapl_sensor() -> Option<PowerSensor> {
         let rapl_root = Path::new("/sys/class/powercap/intel-rapl:0");
-        if !rapl_root.exists() {
-            return None;
-        }
-
-        let mut chosen_energy_path = None;
-        if prefer_uncore {
-            if let Ok(entries) = fs::read_dir(rapl_root) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if let Ok(name) = fs::read_to_string(p.join("name")) {
-                        if name.trim() == "uncore" {
-                            chosen_energy_path = Some(p.join("energy_uj"));
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        let energy_path = chosen_energy_path.unwrap_or_else(|| rapl_root.join("energy_uj"));
-        let mut f = File::open(energy_path).ok()?;
-        let prev_uj = read_u64_fast(&mut f).unwrap_or(0);
-        Some(PowerSensor::EnergyMicrojoules {
-            file: f,
-            prev_uj,
-            prev_instant: Instant::now(),
-        })
-    }
-
-    fn find_cpu_temp_sensor() -> Option<File> {
-        let entries = fs::read_dir("/sys/class/hwmon").ok()?;
+        let entries = fs::read_dir(rapl_root).ok()?;
         for entry in entries.flatten() {
-            let path = entry.path();
-            if let Ok(name) = fs::read_to_string(path.join("name")) {
+            let p = entry.path();
+            if let Ok(name) = fs::read_to_string(p.join("name")) {
                 let n = name.trim();
-                if n == "coretemp" || n == "k10temp" || n == "zenpower" || n == "acpitz" {
-                    if let Ok(file) = File::open(path.join("temp1_input")) {
-                        return Some(file);
+                if n == "uncore" || n == "gpu" || n == "gt" {
+                    if let Ok(mut f) = File::open(p.join("energy_uj")) {
+                        let prev_uj = read_u64_fast(&mut f).unwrap_or(0);
+                        return Some(PowerSensor::EnergyMicrojoules {
+                            file: f,
+                            prev_uj,
+                            prev_instant: Instant::now(),
+                        });
                     }
                 }
             }
@@ -966,74 +782,247 @@ impl HardwareCollector {
     }
 }
 
-fn parse_amd_dpm_clock(file: &mut File) -> (u32, u32) {
-    if file.seek(SeekFrom::Start(0)).is_err() {
-        return (0, 0);
+// ============================================================================
+// Stack-Buffered Sysfs / Procfs Parsers
+// ============================================================================
+
+#[inline]
+fn read_u64_fast(file: &mut File) -> Option<u64> {
+    let mut buf = [0u8; 64];
+    read_u64_buf(file, &mut buf)
+}
+
+#[inline]
+fn read_u64_buf(file: &mut File, buf: &mut [u8; 64]) -> Option<u64> {
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let n = file.read(buf).ok()?;
+    let s = std::str::from_utf8(&buf[..n]).ok()?.trim();
+    s.parse::<u64>().ok()
+}
+
+fn parse_proc_stat(
+    file: &mut File,
+    buf: &mut Vec<u8>,
+    total_out: &mut CpuTimes,
+    cores_out: &mut Vec<CpuTimes>,
+) {
+    buf.clear();
+    if file.seek(SeekFrom::Start(0)).is_err() || file.read_to_end(buf).is_err() {
+        return;
     }
-    let mut buf = [0u8; 512];
-    let Ok(n) = file.read(&mut buf) else {
-        return (0, 0);
-    };
-    let Ok(content) = std::str::from_utf8(&buf[..n]) else {
-        return (0, 0);
+    let text = match std::str::from_utf8(buf) {
+        Ok(t) => t,
+        Err(_) => return,
     };
 
-    let mut active_mhz = 0u32;
-    let mut max_mhz = 0u32;
-
-    for line in content.lines() {
-        if let Some((_, rest)) = line.split_once(':') {
-            let trimmed = rest.trim();
-            let is_active = trimmed.ends_with('*');
-            let mhz = trimmed
-                .split(|c: char| !c.is_ascii_digit())
-                .find(|s| !s.is_empty())
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(0);
-
-            max_mhz = max_mhz.max(mhz);
-            if is_active {
-                active_mhz = mhz;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("cpu") {
+            let mut it = rest.split_whitespace();
+            let first = it.next().unwrap_or("");
+            if rest.starts_with(' ') {
+                *total_out = parse_cpu_fields(first, it);
+            } else if first.chars().all(|c| c.is_ascii_digit()) && !first.is_empty() {
+                let mut fields = rest.split_whitespace();
+                let _cpu_idx = fields.next();
+                let first_val = fields.next().unwrap_or("0");
+                cores_out.push(parse_cpu_fields(first_val, fields));
             }
+        } else if !cores_out.is_empty() {
+            break;
+        }
+    }
+}
+
+#[inline]
+fn parse_cpu_fields<'a, I: Iterator<Item = &'a str>>(first: &str, mut it: I) -> CpuTimes {
+    CpuTimes {
+        user: first.parse().unwrap_or(0),
+        nice: it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+        system: it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+        idle: it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+        iowait: it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+        irq: it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+        softirq: it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+        steal: it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+    }
+}
+
+fn parse_proc_meminfo(file: &mut File, buf: &mut Vec<u8>, mem: &mut MemoryMetrics) {
+    buf.clear();
+    if file.seek(SeekFrom::Start(0)).is_err() || file.read_to_end(buf).is_err() {
+        return;
+    }
+    let text = match std::str::from_utf8(buf) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    let mut mem_total_kb = 0u64;
+    let mut mem_avail_kb = 0u64;
+    let mut swap_total_kb = 0u64;
+    let mut swap_free_kb = 0u64;
+    let mut found = 0u8;
+
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            mem_total_kb = parse_kb_val(rest);
+            found |= 0b0001;
+        } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            mem_avail_kb = parse_kb_val(rest);
+            found |= 0b0010;
+        } else if let Some(rest) = line.strip_prefix("SwapTotal:") {
+            swap_total_kb = parse_kb_val(rest);
+            found |= 0b0100;
+        } else if let Some(rest) = line.strip_prefix("SwapFree:") {
+            swap_free_kb = parse_kb_val(rest);
+            found |= 0b1000;
+        }
+        if found == 0b1111 {
+            break;
         }
     }
 
-    (active_mhz, max_mhz)
+    let mem_used_kb = mem_total_kb.saturating_sub(mem_avail_kb);
+    mem.ram_total_mb = mem_total_kb / 1024;
+    mem.ram_used_mb = mem_used_kb / 1024;
+    mem.ram_pct = if mem_total_kb > 0 {
+        (mem_used_kb as f64 / mem_total_kb as f64 * 100.0) as f32
+    } else {
+        0.0
+    };
+
+    let swap_used_kb = swap_total_kb.saturating_sub(swap_free_kb);
+    mem.swap_total_mb = swap_total_kb / 1024;
+    mem.swap_used_mb = swap_used_kb / 1024;
+    mem.swap_pct = if swap_total_kb > 0 {
+        (swap_used_kb as f64 / swap_total_kb as f64 * 100.0) as f32
+    } else {
+        0.0
+    };
 }
 
 #[inline]
-fn parse_bracketed_algo(s: &str) -> String {
-    if let Some(start) = s.find('[') {
-        if let Some(end) = s[start + 1..].find(']') {
-            return s[start + 1..start + 1 + end].to_string();
-        }
-    }
-    s.trim().to_string()
-}
-
-#[inline]
-fn calc_cpu_delta(prev: CpuTimes, curr: CpuTimes) -> f32 {
-    let total_delta = curr.total.saturating_sub(prev.total);
-    if total_delta == 0 {
-        return 0.0;
-    }
-    let active_delta = curr.active.saturating_sub(prev.active);
-    (active_delta as f32 / total_delta as f32) * 100.0
-}
-
-#[inline]
-fn read_u64_fast(file: &mut File) -> Result<u64> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut buf = [0u8; 32];
-    let n = file.read(&mut buf)?;
-    let s = std::str::from_utf8(&buf[..n])?.trim();
-    Ok(s.parse()?)
-}
-
-#[inline]
-fn parse_kb(s: &str) -> u64 {
-    s.split_ascii_whitespace()
+fn parse_kb_val(s: &str) -> u64 {
+    s.split_whitespace()
         .next()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0)
+}
+
+fn read_zram_mm_stat(file: &mut File, buf: &mut [u8; 256]) -> (u64, u64, u64) {
+    if file.seek(SeekFrom::Start(0)).is_err() {
+        return (0, 0, 0);
+    }
+    let Ok(n) = file.read(buf) else {
+        return (0, 0, 0);
+    };
+    let s = std::str::from_utf8(&buf[..n]).unwrap_or("");
+    let mut it = s.split_whitespace();
+    let orig_data = it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let compr_data = it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let mem_used_total = it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    (orig_data, compr_data, mem_used_total)
+}
+
+fn read_pp_dpm_clocks(file: &mut File, buf: &mut [u8; 256]) -> (u32, u32) {
+    if file.seek(SeekFrom::Start(0)).is_err() {
+        return (0, 0);
+    }
+    let Ok(n) = file.read(buf) else {
+        return (0, 0);
+    };
+    let s = std::str::from_utf8(&buf[..n]).unwrap_or("");
+    let mut active = 0u32;
+    let mut max_mhz = 0u32;
+    for line in s.lines() {
+        if let Some(mhz_tok) = line.split_whitespace().nth(1) {
+            let mhz: u32 = mhz_tok
+                .trim_end_matches(|c: char| !c.is_ascii_digit())
+                .parse()
+                .unwrap_or(0);
+            if mhz > max_mhz {
+                max_mhz = mhz;
+            }
+            if line.contains('*') {
+                active = mhz;
+            }
+        }
+    }
+    (active, max_mhz)
+}
+
+fn read_active_mclk_mts(file: &mut File, buf: &mut [u8; 256]) -> u32 {
+    let (active_mhz, _) = read_pp_dpm_clocks(file, buf);
+    active_mhz * 2
+}
+
+fn detect_ram_speed_mts() -> u32 {
+    // 1. Direct SMBIOS Type 17 table read (works if DMI table is user-readable)
+    if let Ok(dmi) = fs::read("/sys/firmware/dmi/tables/DMI") {
+        let mut i = 0usize;
+        let mut best_speed = 0u32;
+        while i + 4 <= dmi.len() {
+            let rec_type = dmi[i];
+            let rec_len = dmi[i + 1] as usize;
+            if rec_len < 4 || i + rec_len > dmi.len() {
+                break;
+            }
+            if rec_type == 17 && rec_len >= 0x17 {
+                let size_field = u16::from_le_bytes([dmi[i + 0x0C], dmi[i + 0x0D]]);
+                if size_field != 0 && size_field != 0xFFFF {
+                    let speed = u16::from_le_bytes([dmi[i + 0x15], dmi[i + 0x16]]) as u32;
+                    let conf_speed = if rec_len >= 0x22 {
+                        u16::from_le_bytes([dmi[i + 0x20], dmi[i + 0x21]]) as u32
+                    } else {
+                        0
+                    };
+                    let active = if conf_speed > 0 && conf_speed < 65535 {
+                        conf_speed
+                    } else if speed > 0 && speed < 65535 {
+                        speed
+                    } else {
+                        0
+                    };
+                    if active > best_speed {
+                        best_speed = active;
+                    }
+                }
+            }
+            let mut next = i + rec_len;
+            while next + 1 < dmi.len() && !(dmi[next] == 0 && dmi[next + 1] == 0) {
+                next += 1;
+            }
+            i = next + 2;
+        }
+        if best_speed > 0 {
+            return best_speed;
+        }
+    }
+
+    // 2. World-readable udev DMI database fallback (/run/udev/data/+dmi:id)
+    if let Ok(udev_dmi) = fs::read_to_string("/run/udev/data/+dmi:id") {
+        let mut best_speed = 0u32;
+        for line in udev_dmi.lines() {
+            if let Some(rest) = line.strip_prefix("E:MEMORY_DEVICE_") {
+                if let Some((_, val)) = rest.split_once("_CONFIGURED_SPEED_MTS=") {
+                    if let Ok(mts) = val.trim().parse::<u32>() {
+                        if mts > best_speed && mts < 65535 {
+                            best_speed = mts;
+                        }
+                    }
+                } else if let Some((_, val)) = rest.split_once("_SPEED_MTS=") {
+                    if let Ok(mts) = val.trim().parse::<u32>() {
+                        if mts > best_speed && mts < 65535 {
+                            best_speed = mts;
+                        }
+                    }
+                }
+            }
+        }
+        if best_speed > 0 {
+            return best_speed;
+        }
+    }
+
+    0
 }

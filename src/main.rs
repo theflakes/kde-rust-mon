@@ -93,6 +93,7 @@ fn encode_snapshot(snap: &SystemSnapshot, out: &mut Vec<u8>) {
     out.extend_from_slice(&m.ram_total_mb.to_le_bytes());
     out.extend_from_slice(&m.ram_pct.to_le_bytes());
     out.extend_from_slice(&m.ram_speed_mts.to_le_bytes());
+    out.extend_from_slice(&m.ram_current_mts.to_le_bytes());
     out.extend_from_slice(&m.swap_used_mb.to_le_bytes());
     out.extend_from_slice(&m.swap_total_mb.to_le_bytes());
     out.extend_from_slice(&m.swap_pct.to_le_bytes());
@@ -164,6 +165,7 @@ fn decode_snapshot<R: Read>(r: &mut R) -> io::Result<SystemSnapshot> {
         ram_total_mb: read_u64(r)?,
         ram_pct: read_f32(r)?,
         ram_speed_mts: read_u32(r)?,
+        ram_current_mts: read_u32(r)?,
         swap_used_mb: read_u64(r)?,
         swap_total_mb: read_u64(r)?,
         swap_pct: read_f32(r)?,
@@ -337,14 +339,14 @@ impl AppConfig {
                     "show_per_core" => cfg.show_per_core = v.trim() == "true",
                     "window_w" => {
                         if let Ok(w) = v.trim().parse::<f32>() {
-                            if w >= 200.0 && w <= 3840.0 {
+                            if (200.0..=3840.0).contains(&w) {
                                 cfg.window_w = w;
                             }
                         }
                     }
                     "window_h" => {
                         if let Ok(h) = v.trim().parse::<f32>() {
-                            if h >= 120.0 && h <= 2160.0 {
+                            if (120.0..=2160.0).contains(&h) {
                                 cfg.window_h = h;
                             }
                         }
@@ -511,6 +513,7 @@ struct TrayVisualDigest {
     cpu_temp_tenths: u32,
     cpu_power_tenths: u32,
     ram_used_mb: u64,
+    ram_current_mts: u32,
     swap_used_mb: u64,
     gpu_digest: Vec<(u32, u32, u32, u64, u32, u32)>,
 }
@@ -523,6 +526,7 @@ impl TrayVisualDigest {
             cpu_temp_tenths: (s.cpu_temp_c * 10.0).round() as u32,
             cpu_power_tenths: (s.cpu_power_w * 10.0).round() as u32,
             ram_used_mb: s.mem.ram_used_mb,
+            ram_current_mts: s.mem.ram_current_mts,
             swap_used_mb: s.mem.swap_used_mb,
             gpu_digest: s
                 .gpus
@@ -628,7 +632,11 @@ impl Tray for KdeResourceTray {
 
     fn tool_tip(&self) -> ToolTip {
         let m = &self.snapshot.mem;
-        let ram_speed_tag = if m.ram_speed_mts > 0 {
+        let ram_speed_tag = if m.ram_current_mts > 0 && m.ram_speed_mts > 0 {
+            format!(" @ {} / {} MT/s", m.ram_current_mts, m.ram_speed_mts)
+        } else if m.ram_current_mts > 0 {
+            format!(" @ {} MT/s", m.ram_current_mts)
+        } else if m.ram_speed_mts > 0 {
             format!(" @ {} MT/s", m.ram_speed_mts)
         } else {
             String::new()
@@ -693,21 +701,32 @@ impl Tray for KdeResourceTray {
                         "VRAM: {} / {} MiB{}",
                         gpu.vram_used_mb, gpu.vram_total_mb, vclk
                     )
+                } else if m.ram_current_mts > 0 && m.ram_speed_mts > 0 {
+                    format!(
+                        "Unified Memory @ {} / {} MT/s",
+                        m.ram_current_mts, m.ram_speed_mts
+                    )
                 } else if m.ram_speed_mts > 0 {
                     format!("Unified Memory @ {} MT/s", m.ram_speed_mts)
                 } else {
                     "Unified Memory (Shared System RAM)".into()
                 };
 
+                let gpu_power_tag = if gpu.power_w > 0.0 {
+                    format!(" | {:.1} W", gpu.power_w)
+                } else {
+                    String::new()
+                };
+
                 html.push_str(&format!(
-                    "<b>GPU {idx} ({} [{}]):</b> {}% ({}/{} MHz) | {} °C | {:.1} W<br/>{}<br/>",
+                    "<b>GPU {idx} ({} [{}]):</b> {}% ({}/{} MHz) | {} °C{}<br/>{}<br/>",
                     gpu.name,
                     gpu.id,
                     gpu.load_pct,
                     gpu.freq_mhz,
                     gpu.max_freq_mhz,
                     gpu.temp_c,
-                    gpu.power_w,
+                    gpu_power_tag,
                     mem_line
                 ));
             }
@@ -931,7 +950,7 @@ fn compute_max_line_width(ctx: &egui::Context, choice: FontChoice, size: f32) ->
         "RAM: 99.99 / 99.99 GiB (100.0%)  ",
         "VRAM: 8176 / 8176 MiB (100%) @ 2800 / 2800 MHz",
         "Clock Load: 100%  (3100 / 3100 MHz)  ",
-        "Unified Memory (Shared RAM @ 8533 MT/s)",
+        "Unified Memory (Shared RAM @ 8000 / 8000 MT/s)",
     ];
     let font_id = FontId::new(size, choice.to_egui_family());
     ctx.fonts(|f| {
@@ -952,6 +971,19 @@ fn format_vram_clock(active_mhz: u32, max_mhz: u32) -> String {
         format!(" @ {active_mhz} / {max_mhz} MHz")
     } else if active_mhz > 0 {
         format!(" @ {active_mhz} MHz")
+    } else {
+        String::new()
+    }
+}
+
+#[inline]
+fn format_ram_speed(cur_mts: u32, max_mts: u32) -> String {
+    if cur_mts > 0 && max_mts > 0 {
+        format!("• {cur_mts} / {max_mts} MT/s")
+    } else if cur_mts > 0 {
+        format!("• {cur_mts} MT/s")
+    } else if max_mts > 0 {
+        format!("• {max_mts} MT/s")
     } else {
         String::new()
     }
@@ -1212,9 +1244,11 @@ impl eframe::App for MonitorWindowApp {
                             let m = &snap.mem;
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new("Memory & Swap").strong());
-                                if m.ram_speed_mts > 0 {
+                                let ram_badge =
+                                    format_ram_speed(m.ram_current_mts, m.ram_speed_mts);
+                                if !ram_badge.is_empty() {
                                     ui.label(
-                                        RichText::new(format!("• {} MT/s", m.ram_speed_mts))
+                                        RichText::new(ram_badge)
                                             .color(Color32::from_rgb(186, 104, 200)),
                                     );
                                 }
@@ -1286,12 +1320,14 @@ impl eframe::App for MonitorWindowApp {
                                         ))
                                         .strong(),
                                     );
+                                    let gpu_meta = if gpu.power_w > 0.0 {
+                                        format!("• {} °C | {:.1} W", gpu.temp_c, gpu.power_w)
+                                    } else {
+                                        format!("• {} °C", gpu.temp_c)
+                                    };
                                     ui.label(
-                                        RichText::new(format!(
-                                            "• {} °C | {:.1} W",
-                                            gpu.temp_c, gpu.power_w
-                                        ))
-                                        .color(Color32::from_rgb(102, 187, 106)),
+                                        RichText::new(gpu_meta)
+                                            .color(Color32::from_rgb(102, 187, 106)),
                                     );
                                 });
 
@@ -1327,7 +1363,14 @@ impl eframe::App for MonitorWindowApp {
                                             .fill(Color32::from_rgb(46, 110, 90)),
                                     );
                                 } else {
-                                    let unified_text = if snap.mem.ram_speed_mts > 0 {
+                                    let unified_text = if snap.mem.ram_current_mts > 0
+                                        && snap.mem.ram_speed_mts > 0
+                                    {
+                                        format!(
+                                            "Unified Memory (Shared RAM @ {} / {} MT/s)",
+                                            snap.mem.ram_current_mts, snap.mem.ram_speed_mts
+                                        )
+                                    } else if snap.mem.ram_speed_mts > 0 {
                                         format!(
                                             "Unified Memory (Shared RAM @ {} MT/s)",
                                             snap.mem.ram_speed_mts
