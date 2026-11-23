@@ -14,6 +14,7 @@ pub struct MemoryMetrics {
     pub ram_pct: f32,
     pub ram_speed_mts: u32,
     pub ram_current_mts: u32,
+    pub ram_power_w: f32,
     pub swap_used_mb: u64,
     pub swap_total_mb: u64,
     pub swap_pct: f32,
@@ -47,6 +48,9 @@ pub struct GpuMetrics {
 
 #[derive(Clone, Debug, Default)]
 pub struct SystemSnapshot {
+    pub sys_power_w: f32,
+    pub sys_power_is_battery: bool,
+    pub battery_pct: Option<u8>,
     pub cpu_total_pct: f32,
     pub cpu_cores_pct: Vec<f32>,
     pub cpu_avg_mhz: u32,
@@ -134,6 +138,56 @@ impl PowerSensor {
     }
 }
 
+enum BatteryPowerRead {
+    DirectPowerUw(File),
+    VoltageCurrent { voltage_uv: File, current_ua: File },
+}
+
+struct BatterySensor {
+    status_file: File,
+    capacity_file: Option<File>,
+    power_read: BatteryPowerRead,
+}
+
+impl BatterySensor {
+    fn sample(&mut self, buf: &mut [u8; 64]) -> (Option<f32>, Option<u8>) {
+        let cap = self
+            .capacity_file
+            .as_mut()
+            .and_then(|f| read_u64_buf(f, buf))
+            .map(|c| c.min(100) as u8);
+
+        let is_discharging = read_str_buf(&mut self.status_file, buf)
+            .map(|s| s.eq_ignore_ascii_case("Discharging"))
+            .unwrap_or(false);
+
+        if !is_discharging {
+            return (None, cap);
+        }
+
+        let watts = match &mut self.power_read {
+            BatteryPowerRead::DirectPowerUw(f) => {
+                read_u64_buf(f, buf).unwrap_or(0) as f32 / 1_000_000.0
+            }
+            BatteryPowerRead::VoltageCurrent {
+                voltage_uv,
+                current_ua,
+            } => {
+                let v = read_u64_buf(voltage_uv, buf).unwrap_or(0) as f64 / 1_000_000.0;
+                let a =
+                    read_i64_buf(current_ua, buf).unwrap_or(0).unsigned_abs() as f64 / 1_000_000.0;
+                (v * a) as f32
+            }
+        };
+
+        if watts > 0.0 {
+            (Some(watts), cap)
+        } else {
+            (None, cap)
+        }
+    }
+}
+
 struct ZramHandle {
     name: String,
     algorithm: String,
@@ -188,6 +242,9 @@ pub struct HardwareCollector {
     cpu_freq_files: Vec<Option<File>>,
     cpu_temp_file: Option<File>,
     cpu_power_sensor: Option<PowerSensor>,
+    dram_power_sensor: Option<PowerSensor>,
+    battery_sensor: Option<BatterySensor>,
+    psys_power_sensor: Option<PowerSensor>,
     ram_speed_mts: u32,
     apu_mclk_file: Option<File>,
     zrams: Vec<ZramHandle>,
@@ -214,6 +271,9 @@ impl HardwareCollector {
         let cpu_freq_files = Self::open_cpu_freq_files(prev_cores.len());
         let cpu_temp_file = Self::find_cpu_temp_sensor();
         let cpu_power_sensor = Self::find_cpu_power_sensor();
+        let dram_power_sensor = Self::find_dram_power_sensor();
+        let battery_sensor = Self::find_battery_sensor();
+        let psys_power_sensor = Self::find_psys_sensor();
         let ram_speed_mts = detect_ram_speed_mts();
         let apu_mclk_file = Self::find_apu_mclk_file();
         let zrams = Self::discover_zram();
@@ -232,6 +292,9 @@ impl HardwareCollector {
             cpu_freq_files,
             cpu_temp_file,
             cpu_power_sensor,
+            dram_power_sensor,
+            battery_sensor,
+            psys_power_sensor,
             ram_speed_mts,
             apu_mclk_file,
             zrams,
@@ -296,7 +359,30 @@ impl HardwareCollector {
             0.0
         };
 
-        // 4. Memory & Swap
+        // 4. Total System Power (Battery discharge when unplugged, else RAPL psys)
+        let psys_w = self
+            .psys_power_sensor
+            .as_mut()
+            .map(|s| s.read_watts(&mut self.small_buf))
+            .unwrap_or(0.0);
+
+        if let Some(ref mut bat) = self.battery_sensor {
+            let (bat_w, cap) = bat.sample(&mut self.small_buf);
+            snap.battery_pct = cap;
+            if let Some(w) = bat_w {
+                snap.sys_power_w = w;
+                snap.sys_power_is_battery = true;
+            } else {
+                snap.sys_power_w = psys_w;
+                snap.sys_power_is_battery = false;
+            }
+        } else {
+            snap.battery_pct = None;
+            snap.sys_power_w = psys_w;
+            snap.sys_power_is_battery = false;
+        }
+
+        // 5. Memory, Swap & DRAM Power
         parse_proc_meminfo(&mut self.proc_meminfo, &mut self.mem_buf, &mut snap.mem);
         snap.mem.ram_speed_mts = self.ram_speed_mts;
         snap.mem.ram_current_mts = if let Some(ref mut f) = self.apu_mclk_file {
@@ -304,8 +390,13 @@ impl HardwareCollector {
         } else {
             0
         };
+        snap.mem.ram_power_w = if let Some(ref mut sensor) = self.dram_power_sensor {
+            sensor.read_watts(&mut self.small_buf)
+        } else {
+            0.0
+        };
 
-        // 5. ZRAM Devices (in-place update)
+        // 6. ZRAM Devices
         if snap.zrams.len() != self.zrams.len() {
             snap.zrams
                 .resize_with(self.zrams.len(), ZramMetrics::default);
@@ -331,7 +422,7 @@ impl HardwareCollector {
             };
         }
 
-        // 6. GPUs (in-place update)
+        // 7. GPUs
         if snap.gpus.len() != self.gpus.len() {
             snap.gpus.resize_with(self.gpus.len(), GpuMetrics::default);
             for (dst, src) in snap.gpus.iter_mut().zip(self.gpus.iter()) {
@@ -520,6 +611,91 @@ impl HardwareCollector {
             prev_uj,
             prev_instant: Instant::now(),
         })
+    }
+
+    fn find_dram_power_sensor() -> Option<PowerSensor> {
+        let rapl_root = Path::new("/sys/class/powercap/intel-rapl:0");
+        let entries = fs::read_dir(rapl_root).ok()?;
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Ok(name) = fs::read_to_string(p.join("name")) {
+                if name.trim() == "dram" {
+                    if let Ok(mut f) = File::open(p.join("energy_uj")) {
+                        let prev_uj = read_u64_fast(&mut f).unwrap_or(0);
+                        return Some(PowerSensor::EnergyMicrojoules {
+                            file: f,
+                            prev_uj,
+                            prev_instant: Instant::now(),
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn find_battery_sensor() -> Option<BatterySensor> {
+        let entries = fs::read_dir("/sys/class/power_supply").ok()?;
+        let mut bats: Vec<PathBuf> = entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name();
+                if name.to_string_lossy().starts_with("BAT") {
+                    Some(e.path())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        bats.sort();
+
+        for bat in bats {
+            let Ok(status_file) = File::open(bat.join("status")) else {
+                continue;
+            };
+            let capacity_file = File::open(bat.join("capacity")).ok();
+            if let Ok(power_f) = File::open(bat.join("power_now")) {
+                return Some(BatterySensor {
+                    status_file,
+                    capacity_file,
+                    power_read: BatteryPowerRead::DirectPowerUw(power_f),
+                });
+            }
+            if let (Ok(voltage_uv), Ok(current_ua)) = (
+                File::open(bat.join("voltage_now")),
+                File::open(bat.join("current_now")),
+            ) {
+                return Some(BatterySensor {
+                    status_file,
+                    capacity_file,
+                    power_read: BatteryPowerRead::VoltageCurrent {
+                        voltage_uv,
+                        current_ua,
+                    },
+                });
+            }
+        }
+        None
+    }
+
+    fn find_psys_sensor() -> Option<PowerSensor> {
+        let entries = fs::read_dir("/sys/class/powercap").ok()?;
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Ok(name) = fs::read_to_string(p.join("name")) {
+                if name.trim() == "psys" {
+                    if let Ok(mut f) = File::open(p.join("energy_uj")) {
+                        let prev_uj = read_u64_fast(&mut f).unwrap_or(0);
+                        return Some(PowerSensor::EnergyMicrojoules {
+                            file: f,
+                            prev_uj,
+                            prev_instant: Instant::now(),
+                        });
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn find_apu_mclk_file() -> Option<File> {
@@ -800,6 +976,21 @@ fn read_u64_buf(file: &mut File, buf: &mut [u8; 64]) -> Option<u64> {
     s.parse::<u64>().ok()
 }
 
+#[inline]
+fn read_i64_buf(file: &mut File, buf: &mut [u8; 64]) -> Option<i64> {
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let n = file.read(buf).ok()?;
+    let s = std::str::from_utf8(&buf[..n]).ok()?.trim();
+    s.parse::<i64>().ok()
+}
+
+#[inline]
+fn read_str_buf<'a>(file: &mut File, buf: &'a mut [u8; 64]) -> Option<&'a str> {
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let n = file.read(buf).ok()?;
+    std::str::from_utf8(&buf[..n]).ok().map(str::trim)
+}
+
 fn parse_proc_stat(
     file: &mut File,
     buf: &mut Vec<u8>,
@@ -957,7 +1148,6 @@ fn read_active_mclk_mts(file: &mut File, buf: &mut [u8; 256]) -> u32 {
 }
 
 fn detect_ram_speed_mts() -> u32 {
-    // 1. Direct SMBIOS Type 17 table read (works if DMI table is user-readable)
     if let Ok(dmi) = fs::read("/sys/firmware/dmi/tables/DMI") {
         let mut i = 0usize;
         let mut best_speed = 0u32;
@@ -999,7 +1189,6 @@ fn detect_ram_speed_mts() -> u32 {
         }
     }
 
-    // 2. World-readable udev DMI database fallback (/run/udev/data/+dmi:id)
     if let Ok(udev_dmi) = fs::read_to_string("/run/udev/data/+dmi:id") {
         let mut best_speed = 0u32;
         for line in udev_dmi.lines() {

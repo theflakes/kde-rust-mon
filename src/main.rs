@@ -69,9 +69,28 @@ fn read_f32<R: Read>(r: &mut R) -> io::Result<f32> {
     Ok(f32::from_le_bytes(b))
 }
 
+fn read_u8<R: Read>(r: &mut R) -> io::Result<u8> {
+    let mut b = [0u8; 1];
+    r.read_exact(&mut b)?;
+    Ok(b[0])
+}
+
 fn encode_snapshot(snap: &SystemSnapshot, out: &mut Vec<u8>) {
     out.clear();
     out.extend_from_slice(&[0u8; 4]);
+
+    out.extend_from_slice(&snap.sys_power_w.to_le_bytes());
+    out.push(u8::from(snap.sys_power_is_battery));
+    match snap.battery_pct {
+        Some(pct) => {
+            out.push(1);
+            out.push(pct);
+        }
+        None => {
+            out.push(0);
+            out.push(0);
+        }
+    }
 
     out.extend_from_slice(&snap.cpu_total_pct.to_le_bytes());
     out.extend_from_slice(&(snap.cpu_cores_pct.len() as u32).to_le_bytes());
@@ -94,6 +113,7 @@ fn encode_snapshot(snap: &SystemSnapshot, out: &mut Vec<u8>) {
     out.extend_from_slice(&m.ram_pct.to_le_bytes());
     out.extend_from_slice(&m.ram_speed_mts.to_le_bytes());
     out.extend_from_slice(&m.ram_current_mts.to_le_bytes());
+    out.extend_from_slice(&m.ram_power_w.to_le_bytes());
     out.extend_from_slice(&m.swap_used_mb.to_le_bytes());
     out.extend_from_slice(&m.swap_total_mb.to_le_bytes());
     out.extend_from_slice(&m.swap_pct.to_le_bytes());
@@ -131,6 +151,12 @@ fn encode_snapshot(snap: &SystemSnapshot, out: &mut Vec<u8>) {
 fn decode_snapshot<R: Read>(r: &mut R) -> io::Result<SystemSnapshot> {
     let _payload_len = read_u32(r)?;
 
+    let sys_power_w = read_f32(r)?;
+    let sys_power_is_battery = read_u8(r)? != 0;
+    let has_bat = read_u8(r)? != 0;
+    let bat_val = read_u8(r)?;
+    let battery_pct = if has_bat { Some(bat_val) } else { None };
+
     let cpu_total_pct = read_f32(r)?;
     let n_cores = read_u32(r)? as usize;
     if n_cores > 1024 {
@@ -166,6 +192,7 @@ fn decode_snapshot<R: Read>(r: &mut R) -> io::Result<SystemSnapshot> {
         ram_pct: read_f32(r)?,
         ram_speed_mts: read_u32(r)?,
         ram_current_mts: read_u32(r)?,
+        ram_power_w: read_f32(r)?,
         swap_used_mb: read_u64(r)?,
         swap_total_mb: read_u64(r)?,
         swap_pct: read_f32(r)?,
@@ -216,6 +243,9 @@ fn decode_snapshot<R: Read>(r: &mut R) -> io::Result<SystemSnapshot> {
     }
 
     Ok(SystemSnapshot {
+        sys_power_w,
+        sys_power_is_battery,
+        battery_pct,
         cpu_total_pct,
         cpu_cores_pct,
         cpu_avg_mhz,
@@ -508,12 +538,15 @@ impl TraySharedState {
 
 #[derive(PartialEq, Eq, Default)]
 struct TrayVisualDigest {
+    sys_power_tenths: u32,
+    battery_pct: Option<u8>,
     cpu_pct_tenths: u32,
     cpu_avg_mhz: u32,
     cpu_temp_tenths: u32,
     cpu_power_tenths: u32,
     ram_used_mb: u64,
     ram_current_mts: u32,
+    ram_power_tenths: u32,
     swap_used_mb: u64,
     gpu_digest: Vec<(u32, u32, u32, u64, u32, u32)>,
 }
@@ -521,12 +554,15 @@ struct TrayVisualDigest {
 impl TrayVisualDigest {
     fn from_snapshot(s: &SystemSnapshot) -> Self {
         Self {
+            sys_power_tenths: (s.sys_power_w * 10.0).round() as u32,
+            battery_pct: s.battery_pct,
             cpu_pct_tenths: (s.cpu_total_pct * 10.0).round() as u32,
             cpu_avg_mhz: s.cpu_avg_mhz,
             cpu_temp_tenths: (s.cpu_temp_c * 10.0).round() as u32,
             cpu_power_tenths: (s.cpu_power_w * 10.0).round() as u32,
             ram_used_mb: s.mem.ram_used_mb,
             ram_current_mts: s.mem.ram_current_mts,
+            ram_power_tenths: (s.mem.ram_power_w * 10.0).round() as u32,
             swap_used_mb: s.mem.swap_used_mb,
             gpu_digest: s
                 .gpus
@@ -642,6 +678,12 @@ impl Tray for KdeResourceTray {
             String::new()
         };
 
+        let ram_power_tag = if m.ram_power_w > 0.0 {
+            format!(" | {:.1} W", m.ram_power_w)
+        } else {
+            String::new()
+        };
+
         let cpu_freq_tag = if self.snapshot.cpu_avg_mhz > 0 {
             format!(" @ {}", format_mhz(self.snapshot.cpu_avg_mhz))
         } else {
@@ -654,9 +696,31 @@ impl Tray for KdeResourceTray {
             String::new()
         };
 
-        let mut html = format!(
+        let mut html = String::new();
+        if self.snapshot.sys_power_w > 0.0 || self.snapshot.battery_pct.is_some() {
+            let src_label = if self.snapshot.sys_power_is_battery {
+                "Battery"
+            } else {
+                "Platform"
+            };
+            let bat_tag = self
+                .snapshot
+                .battery_pct
+                .map(|b| format!(" (Bat: {b}%)"))
+                .unwrap_or_default();
+            if self.snapshot.sys_power_w > 0.0 {
+                html.push_str(&format!(
+                    "<b>System Power ({src_label}):</b> {:.1} W{bat_tag}<br/>",
+                    self.snapshot.sys_power_w
+                ));
+            } else if let Some(b) = self.snapshot.battery_pct {
+                html.push_str(&format!("<b>Battery:</b> {b}% (AC)<br/>"));
+            }
+        }
+
+        html.push_str(&format!(
             "<b>CPU Total:</b> {:.1}%{} ({:.1} °C{})<br/>\
-             <b>RAM:</b> {:.1} / {:.1} GiB ({:.1}%){}<br/>",
+             <b>RAM:</b> {:.1} / {:.1} GiB ({:.1}%){}{}<br/>",
             self.snapshot.cpu_total_pct,
             cpu_freq_tag,
             self.snapshot.cpu_temp_c,
@@ -665,7 +729,8 @@ impl Tray for KdeResourceTray {
             m.ram_total_mb as f32 / 1024.0,
             m.ram_pct,
             ram_speed_tag,
-        );
+            ram_power_tag,
+        ));
 
         if m.swap_total_mb > 0 {
             html.push_str(&format!(
@@ -977,15 +1042,22 @@ fn format_vram_clock(active_mhz: u32, max_mhz: u32) -> String {
 }
 
 #[inline]
-fn format_ram_speed(cur_mts: u32, max_mts: u32) -> String {
-    if cur_mts > 0 && max_mts > 0 {
-        format!("• {cur_mts} / {max_mts} MT/s")
+fn format_ram_meta(cur_mts: u32, max_mts: u32, power_w: f32) -> String {
+    let speed_str = if cur_mts > 0 && max_mts > 0 {
+        format!("{cur_mts} / {max_mts} MT/s")
     } else if cur_mts > 0 {
-        format!("• {cur_mts} MT/s")
+        format!("{cur_mts} MT/s")
     } else if max_mts > 0 {
-        format!("• {max_mts} MT/s")
+        format!("{max_mts} MT/s")
     } else {
         String::new()
+    };
+
+    match (!speed_str.is_empty(), power_w > 0.0) {
+        (true, true) => format!("• {speed_str} | {power_w:.1} W"),
+        (true, false) => format!("• {speed_str}"),
+        (false, true) => format!("• {power_w:.1} W"),
+        (false, false) => String::new(),
     }
 }
 
@@ -1016,8 +1088,27 @@ impl eframe::App for MonitorWindowApp {
         let bar_height = self.config.font_size + 6.0;
 
         let top_resp = egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.heading(RichText::new("KDE Monitor").strong());
+
+                if snap.sys_power_w > 0.0 || snap.battery_pct.is_some() {
+                    let badge = match (snap.sys_power_w > 0.0, snap.battery_pct) {
+                        (true, Some(b)) if snap.sys_power_is_battery => {
+                            format!("{:.1}W ({b}%)", snap.sys_power_w)
+                        }
+                        (true, Some(b)) => format!("{:.1}W (AC {b}%)", snap.sys_power_w),
+                        (true, None) => format!("{:.1}W", snap.sys_power_w),
+                        (false, Some(b)) => format!("AC {b}%"),
+                        (false, None) => String::new(),
+                    };
+                    if !badge.is_empty() {
+                        ui.label(
+                            RichText::new(badge)
+                                .color(Color32::from_rgb(255, 183, 77))
+                                .strong(),
+                        );
+                    }
+                }
 
                 ui.separator();
 
@@ -1106,13 +1197,9 @@ impl eframe::App for MonitorWindowApp {
                 if ui.button("Hide").clicked() {
                     ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
-
-                ui.min_rect().width()
-            })
-            .inner
+            });
         });
 
-        let top_bar_intrinsic_w = top_resp.inner;
         let top_bar_h = top_resp.response.rect.height();
 
         let scale = self.config.font_size / 13.0;
@@ -1135,10 +1222,7 @@ impl eframe::App for MonitorWindowApp {
         };
 
         let group_pad = 14.0;
-        let intrinsic_bar_w = self
-            .cached_max_line_w
-            .max(grid_w)
-            .max(top_bar_intrinsic_w - group_pad);
+        let intrinsic_bar_w = self.cached_max_line_w.max(grid_w);
 
         let mut content_height = 0.0f32;
 
@@ -1244,8 +1328,11 @@ impl eframe::App for MonitorWindowApp {
                             let m = &snap.mem;
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new("Memory & Swap").strong());
-                                let ram_badge =
-                                    format_ram_speed(m.ram_current_mts, m.ram_speed_mts);
+                                let ram_badge = format_ram_meta(
+                                    m.ram_current_mts,
+                                    m.ram_speed_mts,
+                                    m.ram_power_w,
+                                );
                                 if !ram_badge.is_empty() {
                                     ui.label(
                                         RichText::new(ram_badge)
@@ -1398,8 +1485,7 @@ impl eframe::App for MonitorWindowApp {
             let horiz_pad = margin.left + margin.right + group_pad + 6.0;
             let vert_pad = (margin.top + margin.bottom) * 2.0 + 16.0;
 
-            let target_w = (intrinsic_bar_w + horiz_pad)
-                .max(top_bar_intrinsic_w + margin.left + margin.right + 8.0);
+            let target_w = intrinsic_bar_w + horiz_pad;
             let target_h = top_bar_h + content_height + vert_pad;
             let target = Vec2::new(target_w.ceil(), target_h.ceil());
 
