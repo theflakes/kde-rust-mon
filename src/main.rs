@@ -19,12 +19,14 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const POLL_INTERVALS_MS: [u64; 4] = [500, 1000, 1500, 2000];
+const CTRL_SET_INTERVAL: u8 = 1;
+const CTRL_SET_PER_CORE: u8 = 2;
 
 // ============================================================================
 // Zero-Dependency Binary Snapshot Framing over Standard Pipes
@@ -73,6 +75,15 @@ fn read_u8<R: Read>(r: &mut R) -> io::Result<u8> {
     let mut b = [0u8; 1];
     r.read_exact(&mut b)?;
     Ok(b[0])
+}
+
+fn send_gui_control_msg(tag: u8, payload: u64) {
+    let mut pkt = [0u8; 9];
+    pkt[0] = tag;
+    pkt[1..9].copy_from_slice(&payload.to_le_bytes());
+    let mut stdout = io::stdout().lock();
+    let _ = stdout.write_all(&pkt);
+    let _ = stdout.flush();
 }
 
 fn encode_snapshot(snap: &SystemSnapshot, out: &mut Vec<u8>) {
@@ -133,6 +144,7 @@ fn encode_snapshot(snap: &SystemSnapshot, out: &mut Vec<u8>) {
     for g in &snap.gpus {
         write_str(out, &g.id);
         write_str(out, &g.name);
+        out.push(u8::from(g.is_integrated));
         out.extend_from_slice(&g.load_pct.to_le_bytes());
         out.extend_from_slice(&g.vram_used_mb.to_le_bytes());
         out.extend_from_slice(&g.vram_total_mb.to_le_bytes());
@@ -230,6 +242,7 @@ fn decode_snapshot<R: Read>(r: &mut R) -> io::Result<SystemSnapshot> {
         gpus.push(GpuMetrics {
             id: read_str(r)?,
             name: read_str(r)?,
+            is_integrated: read_u8(r)? != 0,
             load_pct: read_u32(r)?,
             vram_used_mb: read_u64(r)?,
             vram_total_mb: read_u64(r)?,
@@ -418,6 +431,7 @@ struct ActiveGuiClient {
 
 struct TraySharedState {
     interval_ms: AtomicU64,
+    collect_per_core_freqs: AtomicBool,
     latest_snapshot: Mutex<SystemSnapshot>,
     gui_client: Mutex<Option<ActiveGuiClient>>,
     encode_buf: Mutex<Vec<u8>>,
@@ -440,6 +454,10 @@ impl TraySharedState {
         if self.is_window_open() {
             return;
         }
+        let cfg = AppConfig::load();
+        self.collect_per_core_freqs
+            .store(cfg.show_per_core, Ordering::Relaxed);
+
         let Ok(exe) = env::current_exe() else {
             return;
         };
@@ -472,13 +490,25 @@ impl TraySharedState {
         if let Some(mut stdout) = child.stdout.take() {
             let shared_ref = Arc::clone(self);
             thread::spawn(move || {
-                let mut ms_buf = [0u8; 8];
-                while stdout.read_exact(&mut ms_buf).is_ok() {
-                    let ms = u64::from_le_bytes(ms_buf);
-                    if POLL_INTERVALS_MS.contains(&ms) {
-                        shared_ref.interval_ms.store(ms, Ordering::Relaxed);
+                let mut pkt = [0u8; 9];
+                while stdout.read_exact(&mut pkt).is_ok() {
+                    let tag = pkt[0];
+                    let val = u64::from_le_bytes(pkt[1..9].try_into().unwrap_or([0; 8]));
+                    match tag {
+                        CTRL_SET_INTERVAL if POLL_INTERVALS_MS.contains(&val) => {
+                            shared_ref.interval_ms.store(val, Ordering::Relaxed);
+                        }
+                        CTRL_SET_PER_CORE => {
+                            shared_ref
+                                .collect_per_core_freqs
+                                .store(val != 0, Ordering::Relaxed);
+                        }
+                        _ => {}
                     }
                 }
+                shared_ref
+                    .collect_per_core_freqs
+                    .store(false, Ordering::Relaxed);
             });
         }
 
@@ -488,6 +518,7 @@ impl TraySharedState {
     }
 
     fn close_window(&self) {
+        self.collect_per_core_freqs.store(false, Ordering::Relaxed);
         if let Ok(mut guard) = self.gui_client.lock() {
             if let Some(mut client) = guard.take() {
                 drop(client.stdin);
@@ -521,6 +552,7 @@ impl TraySharedState {
         };
 
         if let Ok(Some(_)) = client.child.try_wait() {
+            self.collect_per_core_freqs.store(false, Ordering::Relaxed);
             *guard = None;
             return;
         }
@@ -528,6 +560,7 @@ impl TraySharedState {
         if let Ok(mut buf) = self.encode_buf.lock() {
             encode_snapshot(snap, &mut buf);
             if client.stdin.write_all(&buf).is_err() || client.stdin.flush().is_err() {
+                self.collect_per_core_freqs.store(false, Ordering::Relaxed);
                 let _ = client.child.kill();
                 let _ = client.child.wait();
                 *guard = None;
@@ -537,7 +570,7 @@ impl TraySharedState {
 }
 
 #[derive(PartialEq, Eq, Default)]
-struct TrayVisualDigest {
+struct VisualDigest {
     sys_power_tenths: u32,
     battery_pct: Option<u8>,
     cpu_pct_tenths: u32,
@@ -548,10 +581,11 @@ struct TrayVisualDigest {
     ram_current_mts: u32,
     ram_power_tenths: u32,
     swap_used_mb: u64,
+    zram_compr_kb: u64,
     gpu_digest: Vec<(u32, u32, u32, u64, u32, u32)>,
 }
 
-impl TrayVisualDigest {
+impl VisualDigest {
     fn from_snapshot(s: &SystemSnapshot) -> Self {
         Self {
             sys_power_tenths: (s.sys_power_w * 10.0).round() as u32,
@@ -564,6 +598,7 @@ impl TrayVisualDigest {
             ram_current_mts: s.mem.ram_current_mts,
             ram_power_tenths: (s.mem.ram_power_w * 10.0).round() as u32,
             swap_used_mb: s.mem.swap_used_mb,
+            zram_compr_kb: s.zrams.iter().map(|z| z.compr_bytes / 1024).sum(),
             gpu_digest: s
                 .gpus
                 .iter()
@@ -701,7 +736,7 @@ impl Tray for KdeResourceTray {
             let src_label = if self.snapshot.sys_power_is_battery {
                 "Battery"
             } else {
-                "Platform"
+                "System"
             };
             let bat_tag = self
                 .snapshot
@@ -710,7 +745,7 @@ impl Tray for KdeResourceTray {
                 .unwrap_or_default();
             if self.snapshot.sys_power_w > 0.0 {
                 html.push_str(&format!(
-                    "<b>System Power ({src_label}):</b> {:.1} W{bat_tag}<br/>",
+                    "<b>{src_label} Power:</b> {:.1} W{bat_tag}<br/>",
                     self.snapshot.sys_power_w
                 ));
             } else if let Some(b) = self.snapshot.battery_pct {
@@ -760,21 +795,28 @@ impl Tray for KdeResourceTray {
         if !self.snapshot.gpus.is_empty() {
             html.push_str("<hr/>");
             for (idx, gpu) in self.snapshot.gpus.iter().enumerate() {
-                let mem_line = if gpu.vram_total_mb > 0 {
+                let mem_line = if !gpu.is_integrated && gpu.vram_total_mb > 0 {
                     let vclk = format_vram_clock(gpu.vram_freq_mhz, gpu.vram_max_freq_mhz);
                     format!(
                         "VRAM: {} / {} MiB{}",
                         gpu.vram_used_mb, gpu.vram_total_mb, vclk
                     )
-                } else if m.ram_current_mts > 0 && m.ram_speed_mts > 0 {
-                    format!(
-                        "Unified Memory @ {} / {} MT/s",
-                        m.ram_current_mts, m.ram_speed_mts
-                    )
-                } else if m.ram_speed_mts > 0 {
-                    format!("Unified Memory @ {} MT/s", m.ram_speed_mts)
                 } else {
-                    "Unified Memory (Shared System RAM)".into()
+                    let uma_prefix = if gpu.vram_total_mb > 0 {
+                        format!("UMA: {} / {} MiB | ", gpu.vram_used_mb, gpu.vram_total_mb)
+                    } else {
+                        String::new()
+                    };
+                    if m.ram_current_mts > 0 && m.ram_speed_mts > 0 {
+                        format!(
+                            "{uma_prefix}Unified Memory @ {} / {} MT/s",
+                            m.ram_current_mts, m.ram_speed_mts
+                        )
+                    } else if m.ram_speed_mts > 0 {
+                        format!("{uma_prefix}Unified Memory @ {} MT/s", m.ram_speed_mts)
+                    } else {
+                        format!("{uma_prefix}Unified Memory (Shared System RAM)")
+                    }
                 };
 
                 let gpu_power_tag = if gpu.power_w > 0.0 {
@@ -876,6 +918,7 @@ impl Tray for KdeResourceTray {
 struct GuiWorkerState {
     snapshot: Mutex<SystemSnapshot>,
     interval_ms: AtomicU64,
+    show_per_core: AtomicBool,
     egui_ctx: Mutex<Option<egui::Context>>,
     piped_mode: bool,
 }
@@ -883,8 +926,6 @@ struct GuiWorkerState {
 struct MonitorWindowApp {
     state: Arc<GuiWorkerState>,
     config: AppConfig,
-    started_at: Instant,
-    post_map_fitted: bool,
     initialized_style: bool,
     fit_passes_remaining: u8,
     last_fitted_size: Vec2,
@@ -913,10 +954,8 @@ impl MonitorWindowApp {
         Self {
             state,
             config,
-            started_at: Instant::now(),
-            post_map_fitted: false,
             initialized_style: false,
-            fit_passes_remaining: 3,
+            fit_passes_remaining: 2,
             last_fitted_size: Vec2::ZERO,
             cached_max_line_w: 0.0,
         }
@@ -925,7 +964,7 @@ impl MonitorWindowApp {
     fn trigger_auto_fit(&mut self, ctx: &egui::Context) {
         self.cached_max_line_w =
             compute_max_line_width(ctx, self.config.font_choice, self.config.font_size);
-        self.fit_passes_remaining = 3;
+        self.fit_passes_remaining = 2;
         self.last_fitted_size = Vec2::ZERO;
     }
 }
@@ -1067,12 +1106,6 @@ impl eframe::App for MonitorWindowApp {
             self.initialized_style = true;
             apply_font_style(ctx, self.config.font_choice, self.config.font_size);
             self.trigger_auto_fit(ctx);
-            ctx.request_repaint();
-        }
-
-        if !self.post_map_fitted && self.started_at.elapsed() >= Duration::from_millis(150) {
-            self.post_map_fitted = true;
-            self.trigger_auto_fit(ctx);
         }
 
         let snap = self
@@ -1168,9 +1201,7 @@ impl eframe::App for MonitorWindowApp {
                                 self.config.interval_ms = cur_interval;
                                 config_dirty = true;
                                 if self.state.piped_mode {
-                                    let mut stdout = io::stdout().lock();
-                                    let _ = stdout.write_all(&cur_interval.to_le_bytes());
-                                    let _ = stdout.flush();
+                                    send_gui_control_msg(CTRL_SET_INTERVAL, cur_interval);
                                 }
                             }
                         }
@@ -1262,6 +1293,15 @@ impl eframe::App for MonitorWindowApp {
                                     .checkbox(&mut self.config.show_per_core, "Per-Core")
                                     .changed()
                                 {
+                                    self.state
+                                        .show_per_core
+                                        .store(self.config.show_per_core, Ordering::Relaxed);
+                                    if self.state.piped_mode {
+                                        send_gui_control_msg(
+                                            CTRL_SET_PER_CORE,
+                                            u64::from(self.config.show_per_core),
+                                        );
+                                    }
                                     config_dirty = true;
                                     layout_changed = true;
                                 }
@@ -1429,7 +1469,7 @@ impl eframe::App for MonitorWindowApp {
                                         .fill(Color32::from_rgb(56, 142, 60)),
                                 );
 
-                                if gpu.vram_total_mb > 0 {
+                                if !gpu.is_integrated && gpu.vram_total_mb > 0 {
                                     let vram_frac = (gpu.vram_used_mb as f32
                                         / gpu.vram_total_mb as f32)
                                         .clamp(0.0, 1.0);
@@ -1450,6 +1490,24 @@ impl eframe::App for MonitorWindowApp {
                                             .fill(Color32::from_rgb(46, 110, 90)),
                                     );
                                 } else {
+                                    if gpu.vram_total_mb > 0 {
+                                        let uma_frac = (gpu.vram_used_mb as f32
+                                            / gpu.vram_total_mb as f32)
+                                            .clamp(0.0, 1.0);
+                                        ui.add_space(2.0);
+                                        ui.add(
+                                            ProgressBar::new(uma_frac)
+                                                .desired_width(bar_w)
+                                                .desired_height(bar_height)
+                                                .text(format!(
+                                                    "UMA Carveout: {} / {} MiB ({:.0}%)",
+                                                    gpu.vram_used_mb,
+                                                    gpu.vram_total_mb,
+                                                    uma_frac * 100.0
+                                                ))
+                                                .fill(Color32::from_rgb(46, 110, 90)),
+                                        );
+                                    }
                                     let unified_text = if snap.mem.ram_current_mts > 0
                                         && snap.mem.ram_speed_mts > 0
                                     {
@@ -1502,8 +1560,6 @@ impl eframe::App for MonitorWindowApp {
                 }
             }
             ctx.request_repaint();
-        } else if !self.post_map_fitted {
-            ctx.request_repaint();
         }
 
         if config_dirty {
@@ -1524,7 +1580,7 @@ fn run_gui_worker(piped_mode: bool) -> anyhow::Result<()> {
     } else {
         let mut collector = HardwareCollector::new()?;
         let mut snap = SystemSnapshot::default();
-        collector.sample_into(&mut snap)?;
+        collector.sample_into(&mut snap, config.show_per_core)?;
         snap
     };
 
@@ -1558,9 +1614,11 @@ fn run_gui_worker(piped_mode: bool) -> anyhow::Result<()> {
         )
     };
 
+    let initial_digest = VisualDigest::from_snapshot(&initial_snapshot);
     let state = Arc::new(GuiWorkerState {
         snapshot: Mutex::new(initial_snapshot),
         interval_ms: AtomicU64::new(config.interval_ms),
+        show_per_core: AtomicBool::new(config.show_per_core),
         egui_ctx: Mutex::new(None),
         piped_mode,
     });
@@ -1569,13 +1627,19 @@ fn run_gui_worker(piped_mode: bool) -> anyhow::Result<()> {
     if piped_mode {
         thread::spawn(move || {
             let mut stdin = io::stdin().lock();
+            let mut prev_digest = initial_digest;
             while let Ok(snap) = decode_snapshot(&mut stdin) {
+                let digest = VisualDigest::from_snapshot(&snap);
+                let per_core = state_bg.show_per_core.load(Ordering::Relaxed);
                 if let Ok(mut guard) = state_bg.snapshot.lock() {
                     *guard = snap;
                 }
-                if let Ok(guard) = state_bg.egui_ctx.lock() {
-                    if let Some(ctx) = &*guard {
-                        ctx.request_repaint();
+                if digest != prev_digest || per_core {
+                    prev_digest = digest;
+                    if let Ok(guard) = state_bg.egui_ctx.lock() {
+                        if let Some(ctx) = &*guard {
+                            ctx.request_repaint();
+                        }
                     }
                 }
             }
@@ -1586,16 +1650,22 @@ fn run_gui_worker(piped_mode: bool) -> anyhow::Result<()> {
                 return;
             };
             let mut local_snap = SystemSnapshot::default();
+            let mut prev_digest = initial_digest;
             loop {
                 let sleep_ms = state_bg.interval_ms.load(Ordering::Relaxed);
                 thread::sleep(Duration::from_millis(sleep_ms));
-                if collector.sample_into(&mut local_snap).is_ok() {
+                let per_core = state_bg.show_per_core.load(Ordering::Relaxed);
+                if collector.sample_into(&mut local_snap, per_core).is_ok() {
+                    let digest = VisualDigest::from_snapshot(&local_snap);
                     if let Ok(mut guard) = state_bg.snapshot.lock() {
                         *guard = local_snap.clone();
                     }
-                    if let Ok(guard) = state_bg.egui_ctx.lock() {
-                        if let Some(ctx) = &*guard {
-                            ctx.request_repaint();
+                    if digest != prev_digest || per_core {
+                        prev_digest = digest;
+                        if let Ok(guard) = state_bg.egui_ctx.lock() {
+                            if let Some(ctx) = &*guard {
+                                ctx.request_repaint();
+                            }
                         }
                     }
                 }
@@ -1610,6 +1680,9 @@ fn run_gui_worker(piped_mode: bool) -> anyhow::Result<()> {
             .with_resizable(true)
             .with_inner_size([init_w, init_h])
             .with_min_inner_size([260.0, 140.0]),
+        multisampling: 0,
+        depth_buffer: 0,
+        stencil_buffer: 0,
         ..Default::default()
     };
 
@@ -1675,16 +1748,18 @@ fn main() -> anyhow::Result<()> {
         return run_gui_worker(piped);
     }
 
+    let saved_cfg = AppConfig::load();
+    let start_hidden = args.iter().any(|a| a == "--tray" || a == "--hidden");
+    let initial_per_core = !start_hidden && saved_cfg.show_per_core;
+
     let mut collector = HardwareCollector::new()?;
     let mut snapshot = SystemSnapshot::default();
-    collector.sample_into(&mut snapshot)?;
-    let saved_cfg = AppConfig::load();
-
-    let start_hidden = args.iter().any(|a| a == "--tray" || a == "--hidden");
-    let mut prev_digest = TrayVisualDigest::from_snapshot(&snapshot);
+    collector.sample_into(&mut snapshot, initial_per_core)?;
+    let mut prev_digest = VisualDigest::from_snapshot(&snapshot);
 
     let shared = Arc::new(TraySharedState {
         interval_ms: AtomicU64::new(saved_cfg.interval_ms),
+        collect_per_core_freqs: AtomicBool::new(initial_per_core),
         latest_snapshot: Mutex::new(snapshot.clone()),
         gui_client: Mutex::new(None),
         encode_buf: Mutex::new(Vec::with_capacity(1024)),
@@ -1707,14 +1782,15 @@ fn main() -> anyhow::Result<()> {
         let sleep_ms = shared.interval_ms.load(Ordering::Relaxed);
         thread::sleep(Duration::from_millis(sleep_ms));
 
-        if collector.sample_into(&mut snapshot).is_ok() {
+        let per_core = shared.collect_per_core_freqs.load(Ordering::Relaxed);
+        if collector.sample_into(&mut snapshot, per_core).is_ok() {
             if let Ok(mut guard) = shared.latest_snapshot.lock() {
                 *guard = snapshot.clone();
             }
 
             shared.push_snapshot_to_gui(&snapshot);
 
-            let digest = TrayVisualDigest::from_snapshot(&snapshot);
+            let digest = VisualDigest::from_snapshot(&snapshot);
             if digest != prev_digest {
                 prev_digest = digest;
                 let snap_for_tray = snapshot.clone();

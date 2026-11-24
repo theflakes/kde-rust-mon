@@ -35,6 +35,7 @@ pub struct ZramMetrics {
 pub struct GpuMetrics {
     pub id: String,
     pub name: String,
+    pub is_integrated: bool,
     pub load_pct: u32,
     pub vram_used_mb: u64,
     pub vram_total_mb: u64,
@@ -199,6 +200,7 @@ enum GpuSource {
     AmdDrm {
         id: String,
         name: String,
+        is_integrated: bool,
         busy_file: File,
         vram_used_file: Option<File>,
         vram_total_mb: u64,
@@ -303,7 +305,11 @@ impl HardwareCollector {
         })
     }
 
-    pub fn sample_into(&mut self, snap: &mut SystemSnapshot) -> anyhow::Result<()> {
+    pub fn sample_into(
+        &mut self,
+        snap: &mut SystemSnapshot,
+        collect_per_core_freqs: bool,
+    ) -> anyhow::Result<()> {
         // 1. CPU Utilization
         let mut cur_total = CpuTimes::default();
         let mut cur_cores = Vec::with_capacity(self.prev_cores.len());
@@ -323,28 +329,32 @@ impl HardwareCollector {
         self.prev_total = cur_total;
         self.prev_cores = cur_cores;
 
-        // 2. CPU Core Frequencies
+        // 2. CPU Core Frequencies (only read sysfs when Per-Core view is active)
         snap.cpu_cores_mhz.clear();
-        let mut freq_sum = 0u64;
-        let mut freq_count = 0u64;
-        for opt_f in &mut self.cpu_freq_files {
-            if let Some(f) = opt_f {
-                let khz = read_u64_buf(f, &mut self.small_buf).unwrap_or(0);
-                let mhz = (khz / 1000) as u32;
-                snap.cpu_cores_mhz.push(mhz);
-                if mhz > 0 {
-                    freq_sum += mhz as u64;
-                    freq_count += 1;
+        if collect_per_core_freqs {
+            let mut freq_sum = 0u64;
+            let mut freq_count = 0u64;
+            for opt_f in &mut self.cpu_freq_files {
+                if let Some(f) = opt_f {
+                    let khz = read_u64_buf(f, &mut self.small_buf).unwrap_or(0);
+                    let mhz = (khz / 1000) as u32;
+                    snap.cpu_cores_mhz.push(mhz);
+                    if mhz > 0 {
+                        freq_sum += mhz as u64;
+                        freq_count += 1;
+                    }
+                } else {
+                    snap.cpu_cores_mhz.push(0);
                 }
-            } else {
-                snap.cpu_cores_mhz.push(0);
             }
-        }
-        snap.cpu_avg_mhz = if freq_count > 0 {
-            (freq_sum / freq_count) as u32
+            snap.cpu_avg_mhz = if freq_count > 0 {
+                (freq_sum / freq_count) as u32
+            } else {
+                0
+            };
         } else {
-            0
-        };
+            snap.cpu_avg_mhz = 0;
+        }
 
         // 3. CPU Temp & Power
         snap.cpu_temp_c = if let Some(ref mut f) = self.cpu_temp_file {
@@ -359,30 +369,7 @@ impl HardwareCollector {
             0.0
         };
 
-        // 4. Total System Power (Battery discharge when unplugged, else RAPL psys)
-        let psys_w = self
-            .psys_power_sensor
-            .as_mut()
-            .map(|s| s.read_watts(&mut self.small_buf))
-            .unwrap_or(0.0);
-
-        if let Some(ref mut bat) = self.battery_sensor {
-            let (bat_w, cap) = bat.sample(&mut self.small_buf);
-            snap.battery_pct = cap;
-            if let Some(w) = bat_w {
-                snap.sys_power_w = w;
-                snap.sys_power_is_battery = true;
-            } else {
-                snap.sys_power_w = psys_w;
-                snap.sys_power_is_battery = false;
-            }
-        } else {
-            snap.battery_pct = None;
-            snap.sys_power_w = psys_w;
-            snap.sys_power_is_battery = false;
-        }
-
-        // 5. Memory, Swap & DRAM Power
+        // 4. Memory, Swap & DRAM Power
         parse_proc_meminfo(&mut self.proc_meminfo, &mut self.mem_buf, &mut snap.mem);
         snap.mem.ram_speed_mts = self.ram_speed_mts;
         snap.mem.ram_current_mts = if let Some(ref mut f) = self.apu_mclk_file {
@@ -396,7 +383,7 @@ impl HardwareCollector {
             0.0
         };
 
-        // 6. ZRAM Devices
+        // 5. ZRAM Devices
         if snap.zrams.len() != self.zrams.len() {
             snap.zrams
                 .resize_with(self.zrams.len(), ZramMetrics::default);
@@ -422,17 +409,30 @@ impl HardwareCollector {
             };
         }
 
-        // 7. GPUs
+        // 6. GPUs
         if snap.gpus.len() != self.gpus.len() {
             snap.gpus.resize_with(self.gpus.len(), GpuMetrics::default);
             for (dst, src) in snap.gpus.iter_mut().zip(self.gpus.iter()) {
                 match src {
-                    GpuSource::AmdDrm { id, name, .. }
-                    | GpuSource::IntelXe { id, name, .. }
-                    | GpuSource::IntelI915 { id, name, .. }
-                    | GpuSource::NvidiaNvml { id, name, .. } => {
+                    GpuSource::AmdDrm {
+                        id,
+                        name,
+                        is_integrated,
+                        ..
+                    } => {
                         dst.id.clone_from(id);
                         dst.name.clone_from(name);
+                        dst.is_integrated = *is_integrated;
+                    }
+                    GpuSource::IntelXe { id, name, .. } | GpuSource::IntelI915 { id, name, .. } => {
+                        dst.id.clone_from(id);
+                        dst.name.clone_from(name);
+                        dst.is_integrated = true;
+                    }
+                    GpuSource::NvidiaNvml { id, name, .. } => {
+                        dst.id.clone_from(id);
+                        dst.name.clone_from(name);
+                        dst.is_integrated = false;
                     }
                 }
             }
@@ -545,6 +545,42 @@ impl HardwareCollector {
                     }
                 }
             }
+        }
+
+        // 7. Total System Power
+        let psys_w = self
+            .psys_power_sensor
+            .as_mut()
+            .map(|s| s.read_watts(&mut self.small_buf))
+            .unwrap_or(0.0);
+
+        let dgpu_sum_w: f32 = snap
+            .gpus
+            .iter()
+            .filter(|g| !g.is_integrated)
+            .map(|g| g.power_w)
+            .sum();
+
+        let fallback_total_w = if psys_w > 0.0 {
+            psys_w
+        } else {
+            snap.cpu_power_w + snap.mem.ram_power_w + dgpu_sum_w
+        };
+
+        if let Some(ref mut bat) = self.battery_sensor {
+            let (bat_w, cap) = bat.sample(&mut self.small_buf);
+            snap.battery_pct = cap;
+            if let Some(w) = bat_w {
+                snap.sys_power_w = w;
+                snap.sys_power_is_battery = true;
+            } else {
+                snap.sys_power_w = fallback_total_w;
+                snap.sys_power_is_battery = false;
+            }
+        } else {
+            snap.battery_pct = None;
+            snap.sys_power_w = fallback_total_w;
+            snap.sys_power_is_battery = false;
         }
 
         Ok(())
@@ -802,6 +838,10 @@ impl HardwareCollector {
                 .unwrap_or_default()
                 .trim()
                 .to_string();
+            let class = fs::read_to_string(dev_dir.join("class"))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
             let dev_id = fs::read_to_string(dev_dir.join("device"))
                 .unwrap_or_default()
                 .trim()
@@ -820,6 +860,7 @@ impl HardwareCollector {
                         .and_then(|mut f| read_u64_fast(&mut f))
                         .unwrap_or(0)
                         / (1024 * 1024);
+                    let is_integrated = class.starts_with("0x0380") || vram_total_mb == 0;
                     let sclk_file = File::open(dev_dir.join("pp_dpm_sclk")).ok();
                     let mclk_file = File::open(dev_dir.join("pp_dpm_mclk")).ok();
                     let (temp_file, power_sensor) = Self::find_hwmon_sensors(&dev_dir, &vendor);
@@ -831,6 +872,7 @@ impl HardwareCollector {
                     gpus.push(GpuSource::AmdDrm {
                         id: card,
                         name,
+                        is_integrated,
                         busy_file,
                         vram_used_file,
                         vram_total_mb,
