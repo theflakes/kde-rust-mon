@@ -22,7 +22,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const POLL_INTERVALS_MS: [u64; 4] = [500, 1000, 1500, 2000];
 const CTRL_SET_INTERVAL: u8 = 1;
@@ -764,7 +764,7 @@ impl Tray for KdeResourceTray {
 
         for z in &self.snapshot.zrams {
             html.push_str(&format!(
-                "<b>ZRAM ({} [{}]):</b> Data: {} → Compr: {} ({:.2}x)<br/>\
+                "<b>ZRAM ({} [{}]):</b> Data: {} -> Compr: {} ({:.2}x)<br/>\
                  &nbsp;&nbsp;RAM Used: {} / Disksize: {}<br/>",
                 z.name,
                 z.algorithm,
@@ -896,7 +896,7 @@ impl Tray for KdeResourceTray {
 }
 
 // ============================================================================
-// GUI Worker Window Process (100% Safe Pipe Receiver)
+// GUI Worker Window Process (Measured Pre-Map Sizing via egui::Context)
 // ============================================================================
 
 struct GuiWorkerState {
@@ -910,9 +910,6 @@ struct GuiWorkerState {
 struct MonitorWindowApp {
     state: Arc<GuiWorkerState>,
     config: AppConfig,
-    frame_count: u32,
-    fit_deadline: Option<Instant>,
-    cached_max_line_w: f32,
 }
 
 impl MonitorWindowApp {
@@ -934,20 +931,414 @@ impl MonitorWindowApp {
             *guard = Some(cc.egui_ctx.clone());
         }
 
-        Self {
-            state,
-            config,
-            frame_count: 0,
-            fit_deadline: Some(Instant::now() + Duration::from_millis(1200)),
-            cached_max_line_w: 0.0,
+        Self { state, config }
+    }
+}
+
+fn render_monitor_contents(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    snap: &SystemSnapshot,
+    config: &mut AppConfig,
+    cur_interval: &mut u64,
+    state: &GuiWorkerState,
+    config_dirty: &mut bool,
+    bar_w: f32,
+) -> Option<[f32; 2]> {
+    let mut fit_target = None;
+    let bar_height = config.font_size + 6.0;
+
+    let scale = config.font_size / 13.0;
+    let mono_boost = if config.font_choice == FontChoice::Mono {
+        1.15
+    } else {
+        1.0
+    };
+    let cols: usize = if snap.cpu_cores_mhz.is_empty() { 4 } else { 3 };
+    let cell_w = if snap.cpu_cores_mhz.is_empty() {
+        92.0 * scale * mono_boost
+    } else {
+        136.0 * scale * mono_boost
+    };
+
+    // --- TOP CONTROL BAR ---
+    ui.horizontal(|ui| {
+        ui.heading(RichText::new("KDE Monitor").strong());
+
+        if snap.sys_power_w > 0.0 || snap.battery_pct.is_some() {
+            let badge = match (snap.sys_power_w > 0.0, snap.battery_pct) {
+                (true, Some(b)) if snap.sys_power_is_battery => {
+                    format!("{:.1}W ({b}%)", snap.sys_power_w)
+                }
+                (true, Some(b)) => format!("{:.1}W (AC {b}%)", snap.sys_power_w),
+                (true, None) => format!("{:.1}W", snap.sys_power_w),
+                (false, Some(b)) => format!("AC {b}%"),
+                (false, None) => String::new(),
+            };
+            if !badge.is_empty() {
+                ui.label(
+                    RichText::new(badge)
+                        .color(Color32::from_rgb(255, 183, 77))
+                        .strong(),
+                );
+            }
         }
+
+        ui.separator();
+
+        let prev_font = config.font_choice;
+        egui::ComboBox::from_id_salt("font_family_combo")
+            .selected_text(config.font_choice.label())
+            .width(56.0 * (config.font_size / 13.0))
+            .show_ui(ui, |ui| {
+                for choice in FontChoice::ALL {
+                    ui.selectable_value(&mut config.font_choice, choice, choice.label());
+                }
+            });
+        if config.font_choice != prev_font {
+            apply_font_style(ctx, config.font_choice, config.font_size);
+            *config_dirty = true;
+        }
+
+        if ui
+            .small_button("-")
+            .on_hover_text("Decrease font size")
+            .clicked()
+        {
+            config.font_size = (config.font_size - 1.0).max(9.0);
+            apply_font_style(ctx, config.font_choice, config.font_size);
+            *config_dirty = true;
+        }
+        ui.label(format!("{:.0}pt", config.font_size));
+        if ui
+            .small_button("+")
+            .on_hover_text("Increase font size")
+            .clicked()
+        {
+            config.font_size = (config.font_size + 1.0).min(24.0);
+            apply_font_style(ctx, config.font_choice, config.font_size);
+            *config_dirty = true;
+        }
+
+        ui.separator();
+
+        egui::ComboBox::from_id_salt("poll_rate_combo")
+            .selected_text(format!("{:.1}s", *cur_interval as f32 / 1000.0))
+            .width(52.0 * (config.font_size / 13.0))
+            .show_ui(ui, |ui| {
+                for &ms in &POLL_INTERVALS_MS {
+                    let label = format!("{:.1}s", ms as f32 / 1000.0);
+                    if ui.selectable_value(cur_interval, ms, label).changed() {
+                        state.interval_ms.store(*cur_interval, Ordering::Relaxed);
+                        config.interval_ms = *cur_interval;
+                        *config_dirty = true;
+                        if state.piped_mode {
+                            send_gui_control_msg(CTRL_SET_INTERVAL, *cur_interval);
+                        }
+                    }
+                }
+            });
+
+        if ui.checkbox(&mut config.always_on_top, "Pin").changed() {
+            let level = if config.always_on_top {
+                WindowLevel::AlwaysOnTop
+            } else {
+                WindowLevel::Normal
+            };
+            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(level));
+            *config_dirty = true;
+        }
+
+        if ui
+            .small_button("Fit")
+            .on_hover_text("Compute fitted size for current layout")
+            .clicked()
+        {
+            fit_target = Some(measure_viewport_size(config, snap));
+        }
+
+        if ui.button("Hide").clicked() {
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+    });
+
+    ui.separator();
+
+    // --- CPU SECTION ---
+    ui.group(|ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("CPU").strong());
+            let cpu_meta = if snap.cpu_power_w > 0.0 {
+                format!("{:.1} °C | {:.1} W", snap.cpu_temp_c, snap.cpu_power_w)
+            } else {
+                format!("{:.1} °C", snap.cpu_temp_c)
+            };
+            ui.label(RichText::new(cpu_meta).color(Color32::from_rgb(0, 188, 212)));
+            if snap.cpu_avg_mhz > 0 {
+                ui.label(
+                    RichText::new(format!("• Avg: {}", format_mhz(snap.cpu_avg_mhz)))
+                        .color(Color32::from_rgb(128, 222, 234)),
+                );
+            }
+            if ui.checkbox(&mut config.show_per_core, "Per-Core").changed() {
+                state
+                    .show_per_core
+                    .store(config.show_per_core, Ordering::Relaxed);
+                if state.piped_mode {
+                    send_gui_control_msg(CTRL_SET_PER_CORE, u64::from(config.show_per_core));
+                }
+                *config_dirty = true;
+            }
+        });
+
+        let total_label = if snap.cpu_avg_mhz > 0 {
+            format!(
+                "Total: {:.1}%  (Avg: {})",
+                snap.cpu_total_pct,
+                format_mhz(snap.cpu_avg_mhz)
+            )
+        } else {
+            format!("Total: {:.1}%", snap.cpu_total_pct)
+        };
+
+        ui.add(
+            ProgressBar::new(snap.cpu_total_pct / 100.0)
+                .desired_width(bar_w)
+                .desired_height(bar_height)
+                .text(total_label)
+                .fill(Color32::from_rgb(0, 150, 180)),
+        );
+
+        if config.show_per_core && !snap.cpu_cores_pct.is_empty() {
+            ui.add_space(4.0);
+            egui::Grid::new("cpu_cores_grid")
+                .num_columns(cols)
+                .spacing([6.0, 4.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    for (idx, &pct) in snap.cpu_cores_pct.iter().enumerate() {
+                        let cell_text = if let Some(&mhz) = snap.cpu_cores_mhz.get(idx) {
+                            if mhz > 0 {
+                                format!("C{idx}: {pct:.0}% • {:.2}G", mhz as f32 / 1000.0)
+                            } else {
+                                format!("C{idx}: {pct:.0}%")
+                            }
+                        } else {
+                            format!("C{idx}: {pct:.0}%")
+                        };
+
+                        ui.add(
+                            ProgressBar::new(pct / 100.0)
+                                .desired_height(bar_height)
+                                .text(cell_text)
+                                .desired_width(cell_w),
+                        );
+                        if (idx + 1) % cols == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
+        }
+    });
+
+    ui.add_space(4.0);
+
+    // --- MEMORY & ZRAM SECTION ---
+    ui.group(|ui| {
+        let m = &snap.mem;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Memory & Swap").strong());
+            let ram_badge = format_ram_meta(m.ram_current_mts, m.ram_speed_mts, m.ram_power_w);
+            if !ram_badge.is_empty() {
+                ui.label(RichText::new(ram_badge).color(Color32::from_rgb(186, 104, 200)));
+            }
+        });
+
+        ui.add(
+            ProgressBar::new(m.ram_pct / 100.0)
+                .desired_width(bar_w)
+                .desired_height(bar_height)
+                .text(format!(
+                    "RAM: {:.2} / {:.2} GiB ({:.1}%)",
+                    m.ram_used_mb as f32 / 1024.0,
+                    m.ram_total_mb as f32 / 1024.0,
+                    m.ram_pct
+                ))
+                .fill(Color32::from_rgb(142, 68, 173)),
+        );
+
+        if m.swap_total_mb > 0 {
+            ui.add_space(2.0);
+            ui.add(
+                ProgressBar::new(m.swap_pct / 100.0)
+                    .desired_width(bar_w)
+                    .desired_height(bar_height)
+                    .text(format!(
+                        "Swap: {:.2} / {:.2} GiB ({:.1}%)",
+                        m.swap_used_mb as f32 / 1024.0,
+                        m.swap_total_mb as f32 / 1024.0,
+                        m.swap_pct
+                    ))
+                    .fill(Color32::from_rgb(110, 80, 150)),
+            );
+        }
+
+        for z in &snap.zrams {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("ZRAM ({} [{}])", z.name, z.algorithm)).strong());
+                ui.label(
+                    RichText::new(format!("Ratio: {:.2}x", z.ratio))
+                        .color(Color32::from_rgb(129, 199, 132)),
+                );
+            });
+            ui.label(format!(
+                "Data: {} -> Compr: {} | RAM: {} / {}",
+                format_bytes(z.data_bytes),
+                format_bytes(z.compr_bytes),
+                format_bytes(z.total_ram_bytes),
+                format_bytes(z.disksize_bytes),
+            ));
+        }
+    });
+
+    // --- GPUS SECTION ---
+    for (idx, gpu) in snap.gpus.iter().enumerate() {
+        ui.add_space(4.0);
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("GPU {idx}: {} [{}]", gpu.name, gpu.id)).strong());
+                let gpu_meta = if gpu.power_w > 0.0 {
+                    format!("• {} °C | {:.1} W", gpu.temp_c, gpu.power_w)
+                } else {
+                    format!("• {} °C", gpu.temp_c)
+                };
+                ui.label(RichText::new(gpu_meta).color(Color32::from_rgb(102, 187, 106)));
+            });
+
+            ui.add(
+                ProgressBar::new(gpu.load_pct as f32 / 100.0)
+                    .desired_width(bar_w)
+                    .desired_height(bar_height)
+                    .text(format!(
+                        "Clock Load: {}%  ({} / {} MHz)",
+                        gpu.load_pct, gpu.freq_mhz, gpu.max_freq_mhz
+                    ))
+                    .fill(Color32::from_rgb(56, 142, 60)),
+            );
+
+            if !gpu.is_integrated && gpu.vram_total_mb > 0 {
+                let vram_frac =
+                    (gpu.vram_used_mb as f32 / gpu.vram_total_mb as f32).clamp(0.0, 1.0);
+                let vclk_str = format_vram_clock(gpu.vram_freq_mhz, gpu.vram_max_freq_mhz);
+                ui.add_space(2.0);
+                ui.add(
+                    ProgressBar::new(vram_frac)
+                        .desired_width(bar_w)
+                        .desired_height(bar_height)
+                        .text(format!(
+                            "VRAM: {} / {} MiB ({:.0}%){}",
+                            gpu.vram_used_mb,
+                            gpu.vram_total_mb,
+                            vram_frac * 100.0,
+                            vclk_str
+                        ))
+                        .fill(Color32::from_rgb(46, 110, 90)),
+                );
+            } else {
+                if gpu.vram_total_mb > 0 {
+                    let uma_frac =
+                        (gpu.vram_used_mb as f32 / gpu.vram_total_mb as f32).clamp(0.0, 1.0);
+                    ui.add_space(2.0);
+                    ui.add(
+                        ProgressBar::new(uma_frac)
+                            .desired_width(bar_w)
+                            .desired_height(bar_height)
+                            .text(format!(
+                                "UMA Carveout: {} / {} MiB ({:.0}%)",
+                                gpu.vram_used_mb,
+                                gpu.vram_total_mb,
+                                uma_frac * 100.0
+                            ))
+                            .fill(Color32::from_rgb(46, 110, 90)),
+                    );
+                }
+                let unified_text = if snap.mem.ram_current_mts > 0 && snap.mem.ram_speed_mts > 0 {
+                    format!(
+                        "Unified Memory (Shared RAM @ {} / {} MT/s)",
+                        snap.mem.ram_current_mts, snap.mem.ram_speed_mts
+                    )
+                } else if snap.mem.ram_speed_mts > 0 {
+                    format!(
+                        "Unified Memory (Shared RAM @ {} MT/s)",
+                        snap.mem.ram_speed_mts
+                    )
+                } else {
+                    "Unified Memory (Shared System RAM)".to_string()
+                };
+                ui.label(RichText::new(unified_text).weak());
+            }
+        });
     }
 
-    fn trigger_auto_fit(&mut self, ctx: &egui::Context) {
-        self.cached_max_line_w =
-            compute_max_line_width(ctx, self.config.font_choice, self.config.font_size);
-        self.fit_deadline = Some(Instant::now() + Duration::from_millis(1200));
-    }
+    fit_target
+}
+
+fn measure_viewport_size(config: &AppConfig, snap: &SystemSnapshot) -> [f32; 2] {
+    let ctx = egui::Context::default();
+    ctx.set_visuals(egui::Visuals::dark());
+    setup_system_fonts(&ctx);
+    apply_font_style(&ctx, config.font_choice, config.font_size);
+
+    let mut sim_cfg = config.clone();
+    let mut sim_interval = config.interval_ms;
+    let mut sim_dirty = false;
+    let sim_state = GuiWorkerState {
+        snapshot: Mutex::new(snap.clone()),
+        interval_ms: AtomicU64::new(config.interval_ms),
+        show_per_core: AtomicBool::new(config.show_per_core),
+        egui_ctx: Mutex::new(None),
+        piped_mode: false,
+    };
+
+    let probe_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(680.0, 1200.0));
+    let mut content_rect = egui::Rect::NOTHING;
+
+    let raw_input = egui::RawInput {
+        screen_rect: Some(probe_rect),
+        ..Default::default()
+    };
+
+    let _ = ctx.run(raw_input, |ctx| {
+        let panel_resp = egui::CentralPanel::default().show(ctx, |ui| {
+            let bar_w = (ui.available_width() - 24.0).max(200.0);
+            let inner = ui.vertical(|ui| {
+                let _ = render_monitor_contents(
+                    ui,
+                    ctx,
+                    snap,
+                    &mut sim_cfg,
+                    &mut sim_interval,
+                    &sim_state,
+                    &mut sim_dirty,
+                    bar_w,
+                );
+            });
+            content_rect = inner.response.rect;
+        });
+        let _ = panel_resp;
+    });
+
+    let panel_frame = egui::Frame::central_panel(&ctx.style());
+    let w = (content_rect.width() + panel_frame.inner_margin.left + panel_frame.inner_margin.right)
+        .max(260.0)
+        .ceil();
+    let h =
+        (content_rect.height() + panel_frame.inner_margin.top + panel_frame.inner_margin.bottom)
+            .max(140.0)
+            .ceil();
+
+    [w, h]
 }
 
 fn setup_system_fonts(ctx: &egui::Context) {
@@ -1029,30 +1420,6 @@ fn apply_font_style(ctx: &egui::Context, choice: FontChoice, base_size: f32) {
     ctx.set_style(style);
 }
 
-fn compute_max_line_width(ctx: &egui::Context, choice: FontChoice, size: f32) -> f32 {
-    let sample_strings = [
-        "Data: 99.9G → Compr: 99.9G | RAM: 99.9G / 99.9G",
-        "RAM: 99.99 / 99.99 GiB (100.0%)",
-        "VRAM: 8176 / 8176 MiB (100%) @ 2800 / 2800 MHz",
-        "UMA Carveout: 512 / 512 MiB (100%)",
-        "Clock Load: 100%  (3100 / 3100 MHz)",
-        "Unified Memory (Shared RAM @ 8000 / 8000 MT/s)",
-        "GPU 0: AMD Radeon (7480) [card1] • 50 °C | 12.0 W",
-    ];
-    let font_id = FontId::new(size, choice.to_egui_family());
-    let text_w = ctx.fonts(|f| {
-        sample_strings
-            .iter()
-            .map(|&s| {
-                f.layout_no_wrap(s.to_owned(), font_id.clone(), Color32::WHITE)
-                    .size()
-                    .x
-            })
-            .fold(0.0f32, f32::max)
-    });
-    text_w + 22.0 * (size / 13.0)
-}
-
 #[inline]
 fn format_vram_clock(active_mhz: u32, max_mhz: u32) -> String {
     if active_mhz > 0 && max_mhz > 0 {
@@ -1086,16 +1453,6 @@ fn format_ram_meta(cur_mts: u32, max_mts: u32, power_w: f32) -> String {
 
 impl eframe::App for MonitorWindowApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.frame_count = self.frame_count.saturating_add(1);
-
-        if self.frame_count == 1 {
-            apply_font_style(ctx, self.config.font_choice, self.config.font_size);
-        }
-        if self.frame_count <= 2 || self.cached_max_line_w <= 0.0 {
-            self.cached_max_line_w =
-                compute_max_line_width(ctx, self.config.font_choice, self.config.font_size);
-        }
-
         let snap = self
             .state
             .snapshot
@@ -1105,520 +1462,35 @@ impl eframe::App for MonitorWindowApp {
 
         let mut cur_interval = self.state.interval_ms.load(Ordering::Relaxed);
         let mut config_dirty = false;
-        let mut layout_changed = false;
-        let bar_height = self.config.font_size + 6.0;
-
-        let top_resp = egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.heading(RichText::new("KDE Monitor").strong());
-
-                if snap.sys_power_w > 0.0 || snap.battery_pct.is_some() {
-                    let badge = match (snap.sys_power_w > 0.0, snap.battery_pct) {
-                        (true, Some(b)) if snap.sys_power_is_battery => {
-                            format!("{:.1}W ({b}%)", snap.sys_power_w)
-                        }
-                        (true, Some(b)) => format!("{:.1}W (AC {b}%)", snap.sys_power_w),
-                        (true, None) => format!("{:.1}W", snap.sys_power_w),
-                        (false, Some(b)) => format!("AC {b}%"),
-                        (false, None) => String::new(),
-                    };
-                    if !badge.is_empty() {
-                        ui.label(
-                            RichText::new(badge)
-                                .color(Color32::from_rgb(255, 183, 77))
-                                .strong(),
-                        );
-                    }
-                }
-
-                ui.separator();
-
-                let prev_font = self.config.font_choice;
-                egui::ComboBox::from_id_salt("font_family_combo")
-                    .selected_text(self.config.font_choice.label())
-                    .width(56.0 * (self.config.font_size / 13.0))
-                    .show_ui(ui, |ui| {
-                        for choice in FontChoice::ALL {
-                            ui.selectable_value(
-                                &mut self.config.font_choice,
-                                choice,
-                                choice.label(),
-                            );
-                        }
-                    });
-                if self.config.font_choice != prev_font {
-                    apply_font_style(ctx, self.config.font_choice, self.config.font_size);
-                    config_dirty = true;
-                    layout_changed = true;
-                }
-
-                if ui
-                    .small_button("−")
-                    .on_hover_text("Decrease font size")
-                    .clicked()
-                {
-                    self.config.font_size = (self.config.font_size - 1.0).max(9.0);
-                    apply_font_style(ctx, self.config.font_choice, self.config.font_size);
-                    config_dirty = true;
-                    layout_changed = true;
-                }
-                ui.label(format!("{:.0}pt", self.config.font_size));
-                if ui
-                    .small_button("+")
-                    .on_hover_text("Increase font size")
-                    .clicked()
-                {
-                    self.config.font_size = (self.config.font_size + 1.0).min(24.0);
-                    apply_font_style(ctx, self.config.font_choice, self.config.font_size);
-                    config_dirty = true;
-                    layout_changed = true;
-                }
-
-                ui.separator();
-
-                egui::ComboBox::from_id_salt("poll_rate_combo")
-                    .selected_text(format!("{:.1}s", cur_interval as f32 / 1000.0))
-                    .width(52.0 * (self.config.font_size / 13.0))
-                    .show_ui(ui, |ui| {
-                        for &ms in &POLL_INTERVALS_MS {
-                            let label = format!("{:.1}s", ms as f32 / 1000.0);
-                            if ui.selectable_value(&mut cur_interval, ms, label).changed() {
-                                self.state
-                                    .interval_ms
-                                    .store(cur_interval, Ordering::Relaxed);
-                                self.config.interval_ms = cur_interval;
-                                config_dirty = true;
-                                if self.state.piped_mode {
-                                    send_gui_control_msg(CTRL_SET_INTERVAL, cur_interval);
-                                }
-                            }
-                        }
-                    });
-
-                if ui.checkbox(&mut self.config.always_on_top, "Pin").changed() {
-                    let level = if self.config.always_on_top {
-                        WindowLevel::AlwaysOnTop
-                    } else {
-                        WindowLevel::Normal
-                    };
-                    ctx.send_viewport_cmd(ViewportCommand::WindowLevel(level));
-                    config_dirty = true;
-                }
-
-                if ui
-                    .small_button("Fit")
-                    .on_hover_text("Fit window to content")
-                    .clicked()
-                {
-                    layout_changed = true;
-                }
-
-                if ui.button("Hide").clicked() {
-                    ctx.send_viewport_cmd(ViewportCommand::Close);
-                }
-            });
-        });
-
-        let top_bar_h = top_resp.response.rect.height();
-
-        let scale = self.config.font_size / 13.0;
-        let mono_boost = if self.config.font_choice == FontChoice::Mono {
-            1.15
-        } else {
-            1.0
-        };
-        let cols: usize = if snap.cpu_cores_mhz.is_empty() { 4 } else { 3 };
-        let cell_w = if snap.cpu_cores_mhz.is_empty() {
-            92.0 * scale * mono_boost
-        } else {
-            136.0 * scale * mono_boost
-        };
-
-        let grid_w = if self.config.show_per_core && !snap.cpu_cores_pct.is_empty() {
-            (cell_w * cols as f32) + (6.0 * (cols.saturating_sub(1) as f32))
-        } else {
-            0.0
-        };
-
-        let group_pad = 14.0;
-        let intrinsic_bar_w = self.cached_max_line_w.max(grid_w);
-
-        let mut unclipped_content_h = 0.0f32;
+        let mut fit_target = None;
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let bar_w = if self.fit_deadline.is_some() || layout_changed {
-                intrinsic_bar_w
-            } else {
-                (ui.available_width() - group_pad).max(intrinsic_bar_w)
-            };
+            let bar_w = (ui.available_width() - 24.0).max(200.0);
 
-            egui::ScrollArea::vertical()
+            egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let inner = ui.vertical(|ui| {
-                        // --- CPU SECTION ---
-                        ui.group(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new("CPU").strong());
-                                let cpu_meta = if snap.cpu_power_w > 0.0 {
-                                    format!("{:.1} °C | {:.1} W", snap.cpu_temp_c, snap.cpu_power_w)
-                                } else {
-                                    format!("{:.1} °C", snap.cpu_temp_c)
-                                };
-                                ui.label(
-                                    RichText::new(cpu_meta).color(Color32::from_rgb(0, 188, 212)),
-                                );
-                                if snap.cpu_avg_mhz > 0 {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "• Avg: {}",
-                                            format_mhz(snap.cpu_avg_mhz)
-                                        ))
-                                        .color(Color32::from_rgb(128, 222, 234)),
-                                    );
-                                }
-                                if ui
-                                    .checkbox(&mut self.config.show_per_core, "Per-Core")
-                                    .changed()
-                                {
-                                    self.state
-                                        .show_per_core
-                                        .store(self.config.show_per_core, Ordering::Relaxed);
-                                    if self.state.piped_mode {
-                                        send_gui_control_msg(
-                                            CTRL_SET_PER_CORE,
-                                            u64::from(self.config.show_per_core),
-                                        );
-                                    }
-                                    config_dirty = true;
-                                    layout_changed = true;
-                                }
-                            });
-
-                            let total_label = if snap.cpu_avg_mhz > 0 {
-                                format!(
-                                    "Total: {:.1}%  (Avg: {})",
-                                    snap.cpu_total_pct,
-                                    format_mhz(snap.cpu_avg_mhz)
-                                )
-                            } else {
-                                format!("Total: {:.1}%", snap.cpu_total_pct)
-                            };
-
-                            ui.add(
-                                ProgressBar::new(snap.cpu_total_pct / 100.0)
-                                    .desired_width(bar_w)
-                                    .desired_height(bar_height)
-                                    .text(total_label)
-                                    .fill(Color32::from_rgb(0, 150, 180)),
-                            );
-
-                            if self.config.show_per_core && !snap.cpu_cores_pct.is_empty() {
-                                ui.add_space(4.0);
-                                egui::Grid::new("cpu_cores_grid")
-                                    .num_columns(cols)
-                                    .spacing([6.0, 4.0])
-                                    .striped(true)
-                                    .show(ui, |ui| {
-                                        for (idx, &pct) in snap.cpu_cores_pct.iter().enumerate() {
-                                            let cell_text =
-                                                if let Some(&mhz) = snap.cpu_cores_mhz.get(idx) {
-                                                    if mhz > 0 {
-                                                        format!(
-                                                            "C{idx}: {pct:.0}% • {:.2}G",
-                                                            mhz as f32 / 1000.0
-                                                        )
-                                                    } else {
-                                                        format!("C{idx}: {pct:.0}%")
-                                                    }
-                                                } else {
-                                                    format!("C{idx}: {pct:.0}%")
-                                                };
-
-                                            ui.add(
-                                                ProgressBar::new(pct / 100.0)
-                                                    .desired_height(bar_height)
-                                                    .text(cell_text)
-                                                    .desired_width(cell_w),
-                                            );
-                                            if (idx + 1) % cols == 0 {
-                                                ui.end_row();
-                                            }
-                                        }
-                                    });
-                            }
-                        });
-
-                        ui.add_space(4.0);
-
-                        // --- MEMORY & ZRAM SECTION ---
-                        ui.group(|ui| {
-                            let m = &snap.mem;
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new("Memory & Swap").strong());
-                                let ram_badge = format_ram_meta(
-                                    m.ram_current_mts,
-                                    m.ram_speed_mts,
-                                    m.ram_power_w,
-                                );
-                                if !ram_badge.is_empty() {
-                                    ui.label(
-                                        RichText::new(ram_badge)
-                                            .color(Color32::from_rgb(186, 104, 200)),
-                                    );
-                                }
-                            });
-
-                            ui.add(
-                                ProgressBar::new(m.ram_pct / 100.0)
-                                    .desired_width(bar_w)
-                                    .desired_height(bar_height)
-                                    .text(format!(
-                                        "RAM: {:.2} / {:.2} GiB ({:.1}%)",
-                                        m.ram_used_mb as f32 / 1024.0,
-                                        m.ram_total_mb as f32 / 1024.0,
-                                        m.ram_pct
-                                    ))
-                                    .fill(Color32::from_rgb(142, 68, 173)),
-                            );
-
-                            if m.swap_total_mb > 0 {
-                                ui.add_space(2.0);
-                                ui.add(
-                                    ProgressBar::new(m.swap_pct / 100.0)
-                                        .desired_width(bar_w)
-                                        .desired_height(bar_height)
-                                        .text(format!(
-                                            "Swap: {:.2} / {:.2} GiB ({:.1}%)",
-                                            m.swap_used_mb as f32 / 1024.0,
-                                            m.swap_total_mb as f32 / 1024.0,
-                                            m.swap_pct
-                                        ))
-                                        .fill(Color32::from_rgb(110, 80, 150)),
-                                );
-                            }
-
-                            for z in &snap.zrams {
-                                ui.separator();
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "ZRAM ({} [{}])",
-                                            z.name, z.algorithm
-                                        ))
-                                        .strong(),
-                                    );
-                                    ui.label(
-                                        RichText::new(format!("Ratio: {:.2}x", z.ratio))
-                                            .color(Color32::from_rgb(129, 199, 132)),
-                                    );
-                                });
-                                ui.label(format!(
-                                    "Data: {} → Compr: {} | RAM: {} / {}",
-                                    format_bytes(z.data_bytes),
-                                    format_bytes(z.compr_bytes),
-                                    format_bytes(z.total_ram_bytes),
-                                    format_bytes(z.disksize_bytes),
-                                ));
-                            }
-                        });
-
-                        // --- GPUS SECTION ---
-                        for (idx, gpu) in snap.gpus.iter().enumerate() {
-                            ui.add_space(4.0);
-                            ui.group(|ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "GPU {idx}: {} [{}]",
-                                            gpu.name, gpu.id
-                                        ))
-                                        .strong(),
-                                    );
-                                    let gpu_meta = if gpu.power_w > 0.0 {
-                                        format!("• {} °C | {:.1} W", gpu.temp_c, gpu.power_w)
-                                    } else {
-                                        format!("• {} °C", gpu.temp_c)
-                                    };
-                                    ui.label(
-                                        RichText::new(gpu_meta)
-                                            .color(Color32::from_rgb(102, 187, 106)),
-                                    );
-                                });
-
-                                ui.add(
-                                    ProgressBar::new(gpu.load_pct as f32 / 100.0)
-                                        .desired_width(bar_w)
-                                        .desired_height(bar_height)
-                                        .text(format!(
-                                            "Clock Load: {}%  ({} / {} MHz)",
-                                            gpu.load_pct, gpu.freq_mhz, gpu.max_freq_mhz
-                                        ))
-                                        .fill(Color32::from_rgb(56, 142, 60)),
-                                );
-
-                                if !gpu.is_integrated && gpu.vram_total_mb > 0 {
-                                    let vram_frac = (gpu.vram_used_mb as f32
-                                        / gpu.vram_total_mb as f32)
-                                        .clamp(0.0, 1.0);
-                                    let vclk_str =
-                                        format_vram_clock(gpu.vram_freq_mhz, gpu.vram_max_freq_mhz);
-                                    ui.add_space(2.0);
-                                    ui.add(
-                                        ProgressBar::new(vram_frac)
-                                            .desired_width(bar_w)
-                                            .desired_height(bar_height)
-                                            .text(format!(
-                                                "VRAM: {} / {} MiB ({:.0}%){}",
-                                                gpu.vram_used_mb,
-                                                gpu.vram_total_mb,
-                                                vram_frac * 100.0,
-                                                vclk_str
-                                            ))
-                                            .fill(Color32::from_rgb(46, 110, 90)),
-                                    );
-                                } else {
-                                    if gpu.vram_total_mb > 0 {
-                                        let uma_frac = (gpu.vram_used_mb as f32
-                                            / gpu.vram_total_mb as f32)
-                                            .clamp(0.0, 1.0);
-                                        ui.add_space(2.0);
-                                        ui.add(
-                                            ProgressBar::new(uma_frac)
-                                                .desired_width(bar_w)
-                                                .desired_height(bar_height)
-                                                .text(format!(
-                                                    "UMA Carveout: {} / {} MiB ({:.0}%)",
-                                                    gpu.vram_used_mb,
-                                                    gpu.vram_total_mb,
-                                                    uma_frac * 100.0
-                                                ))
-                                                .fill(Color32::from_rgb(46, 110, 90)),
-                                        );
-                                    }
-                                    let unified_text = if snap.mem.ram_current_mts > 0
-                                        && snap.mem.ram_speed_mts > 0
-                                    {
-                                        format!(
-                                            "Unified Memory (Shared RAM @ {} / {} MT/s)",
-                                            snap.mem.ram_current_mts, snap.mem.ram_speed_mts
-                                        )
-                                    } else if snap.mem.ram_speed_mts > 0 {
-                                        format!(
-                                            "Unified Memory (Shared RAM @ {} MT/s)",
-                                            snap.mem.ram_speed_mts
-                                        )
-                                    } else {
-                                        "Unified Memory (Shared System RAM)".to_string()
-                                    };
-                                    ui.label(RichText::new(unified_text).weak());
-                                }
-                            });
-                        }
-                    });
-
-                    unclipped_content_h = inner.response.rect.height();
+                    fit_target = render_monitor_contents(
+                        ui,
+                        ctx,
+                        &snap,
+                        &mut self.config,
+                        &mut cur_interval,
+                        &self.state,
+                        &mut config_dirty,
+                        bar_w,
+                    );
                 });
         });
 
-        if layout_changed {
-            self.trigger_auto_fit(ctx);
-        }
-
-        if let Some(deadline) = self.fit_deadline {
-            let margin = ctx.style().spacing.window_margin;
-            let horiz_pad = margin.left + margin.right + group_pad + 8.0;
-            let vert_pad = (margin.top + margin.bottom) * 2.0 + 24.0;
-
-            let target_w = (intrinsic_bar_w + horiz_pad).ceil();
-            let target_h = (top_bar_h + unclipped_content_h + vert_pad).ceil();
-            let target = Vec2::new(target_w, target_h);
-
-            let current_inner = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()));
-            let converged = self.frame_count >= 4
-                && current_inner
-                    .map(|cur| (cur.x - target.x).abs() <= 2.0 && (cur.y - target.y).abs() <= 2.0)
-                    .unwrap_or(false);
-
-            if converged || Instant::now() >= deadline {
-                self.fit_deadline = None;
-                ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(Vec2::new(260.0, 140.0)));
-                ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(Vec2::new(3840.0, 2160.0)));
-            } else if target.x > 50.0 && target.y > 50.0 {
-                ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(target));
-                ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(target));
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
-                ctx.request_repaint_after(Duration::from_millis(35));
-            }
+        if let Some([w, h]) = fit_target {
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(w, h)));
         }
 
         if config_dirty {
             self.config.save();
         }
     }
-}
-
-fn estimate_initial_viewport_size(config: &AppConfig, snap: &SystemSnapshot) -> (f32, f32) {
-    let font_sz = config.font_size;
-    let bar_h = font_sz + 6.0;
-    let line_h = font_sz * 1.38;
-    let spacing_y = 8.0;
-    let group_chrome_h = 18.0;
-
-    let char_w = match config.font_choice {
-        FontChoice::Mono => font_sz * 0.64,
-        FontChoice::Sans => font_sz * 0.56,
-        FontChoice::Serif => font_sz * 0.55,
-    };
-
-    let max_text_w = (49.0 * char_w) + 54.0;
-
-    let scale = font_sz / 13.0;
-    let mono_boost = if config.font_choice == FontChoice::Mono {
-        1.15
-    } else {
-        1.0
-    };
-    let cols: usize = if snap.cpu_cores_mhz.is_empty() { 4 } else { 3 };
-    let cell_w = if snap.cpu_cores_mhz.is_empty() {
-        92.0 * scale * mono_boost
-    } else {
-        136.0 * scale * mono_boost
-    };
-    let grid_w = if config.show_per_core && !snap.cpu_cores_pct.is_empty() {
-        (cell_w * cols as f32) + (6.0 * (cols.saturating_sub(1) as f32)) + 30.0
-    } else {
-        0.0
-    };
-
-    let init_w = max_text_w.max(grid_w).ceil();
-
-    let mut est_h = (line_h * 2.4) + spacing_y + 34.0;
-    est_h += group_chrome_h + line_h + spacing_y + bar_h;
-    if config.show_per_core && !snap.cpu_cores_pct.is_empty() {
-        let rows = snap.cpu_cores_pct.len().div_ceil(cols);
-        est_h += spacing_y + 4.0 + (rows as f32 * (bar_h + 4.0));
-    }
-
-    est_h += 4.0 + spacing_y + group_chrome_h + line_h + spacing_y + bar_h;
-    if snap.mem.swap_total_mb > 0 {
-        est_h += spacing_y + 2.0 + bar_h;
-    }
-    est_h += snap.zrams.len() as f32 * ((spacing_y * 3.0) + 6.0 + (line_h * 2.0));
-
-    for g in &snap.gpus {
-        est_h += 4.0 + spacing_y + group_chrome_h + line_h + spacing_y + bar_h;
-        if !g.is_integrated && g.vram_total_mb > 0 {
-            est_h += spacing_y + 2.0 + bar_h;
-        } else {
-            if g.vram_total_mb > 0 {
-                est_h += spacing_y + 2.0 + bar_h;
-            }
-            est_h += spacing_y + line_h;
-        }
-    }
-
-    (init_w.max(300.0), est_h.ceil().max(240.0))
 }
 
 fn run_gui_worker(piped_mode: bool, window_seq: u64) -> anyhow::Result<()> {
@@ -1637,8 +1509,7 @@ fn run_gui_worker(piped_mode: bool, window_seq: u64) -> anyhow::Result<()> {
         snap
     };
 
-    let (init_w, init_h) = estimate_initial_viewport_size(&config, &initial_snapshot);
-
+    let initial_size = measure_viewport_size(&config, &initial_snapshot);
     let initial_digest = VisualDigest::from_snapshot(&initial_snapshot);
     let state = Arc::new(GuiWorkerState {
         snapshot: Mutex::new(initial_snapshot),
@@ -1704,7 +1575,7 @@ fn run_gui_worker(piped_mode: bool, window_seq: u64) -> anyhow::Result<()> {
             .with_title("KDE Rust Hardware Monitor")
             .with_app_id(app_id)
             .with_resizable(true)
-            .with_inner_size([init_w, init_h])
+            .with_inner_size(initial_size)
             .with_min_inner_size([260.0, 140.0]),
         multisampling: 0,
         depth_buffer: 0,
