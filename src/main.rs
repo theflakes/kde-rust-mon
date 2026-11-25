@@ -927,6 +927,7 @@ struct MonitorWindowApp {
     state: Arc<GuiWorkerState>,
     config: AppConfig,
     initialized_style: bool,
+    mapped_fitted: bool,
     fit_passes_remaining: u8,
     last_fitted_size: Vec2,
     cached_max_line_w: f32,
@@ -955,7 +956,8 @@ impl MonitorWindowApp {
             state,
             config,
             initialized_style: false,
-            fit_passes_remaining: 2,
+            mapped_fitted: false,
+            fit_passes_remaining: 4,
             last_fitted_size: Vec2::ZERO,
             cached_max_line_w: 0.0,
         }
@@ -964,7 +966,7 @@ impl MonitorWindowApp {
     fn trigger_auto_fit(&mut self, ctx: &egui::Context) {
         self.cached_max_line_w =
             compute_max_line_width(ctx, self.config.font_choice, self.config.font_size);
-        self.fit_passes_remaining = 2;
+        self.fit_passes_remaining = 4;
         self.last_fitted_size = Vec2::ZERO;
     }
 }
@@ -1105,6 +1107,11 @@ impl eframe::App for MonitorWindowApp {
         if !self.initialized_style {
             self.initialized_style = true;
             apply_font_style(ctx, self.config.font_choice, self.config.font_size);
+            self.trigger_auto_fit(ctx);
+        }
+
+        if !self.mapped_fitted && ctx.input(|i| i.viewport().inner_rect.is_some()) {
+            self.mapped_fitted = true;
             self.trigger_auto_fit(ctx);
         }
 
