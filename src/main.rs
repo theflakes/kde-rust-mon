@@ -910,6 +910,7 @@ struct GuiWorkerState {
 struct MonitorWindowApp {
     state: Arc<GuiWorkerState>,
     config: AppConfig,
+    frame_count: u32,
 }
 
 impl MonitorWindowApp {
@@ -931,7 +932,11 @@ impl MonitorWindowApp {
             *guard = Some(cc.egui_ctx.clone());
         }
 
-        Self { state, config }
+        Self {
+            state,
+            config,
+            frame_count: 0,
+        }
     }
 }
 
@@ -954,8 +959,8 @@ fn render_monitor_contents(
     } else {
         1.0
     };
-    let cols: usize = if snap.cpu_cores_mhz.is_empty() { 4 } else { 3 };
-    let cell_w = if snap.cpu_cores_mhz.is_empty() {
+    let cols: usize = if config.show_per_core { 3 } else { 4 };
+    let cell_w = if !config.show_per_core {
         92.0 * scale * mono_boost
     } else {
         136.0 * scale * mono_boost
@@ -1315,8 +1320,8 @@ fn measure_viewport_size(config: &AppConfig, snap: &SystemSnapshot) -> [f32; 2] 
     } else {
         1.0
     };
-    let cols: usize = if snap.cpu_cores_mhz.is_empty() { 4 } else { 3 };
-    let cell_w = if snap.cpu_cores_mhz.is_empty() {
+    let cols: usize = if config.show_per_core { 3 } else { 4 };
+    let cell_w = if !config.show_per_core {
         92.0 * scale * mono_boost
     } else {
         136.0 * scale * mono_boost
@@ -1525,6 +1530,17 @@ impl eframe::App for MonitorWindowApp {
                     );
                 });
         });
+
+        // The compositor may ignore or alter the initial inner size while the window is
+        // still being mapped, so re-apply the measured fit a few times right after
+        // startup (the same command the Fit button sends, which is known to work).
+        self.frame_count = self.frame_count.saturating_add(1);
+        if fit_target.is_none() && matches!(self.frame_count, 3 | 8 | 20) {
+            fit_target = Some(measure_viewport_size(&self.config, &snap));
+        }
+        if self.frame_count < 21 {
+            ctx.request_repaint_after(Duration::from_millis(30));
+        }
 
         if let Some([w, h]) = fit_target {
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(w, h)));
