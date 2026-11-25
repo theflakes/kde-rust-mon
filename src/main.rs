@@ -1276,7 +1276,7 @@ fn render_monitor_contents(
                 } else {
                     "Unified Memory (Shared System RAM)".to_string()
                 };
-                ui.label(RichText::new(unified_text).weak());
+                ui.label(RichText::new(unified_text).color(Color32::from_rgb(180, 185, 195)));
             }
         });
     }
@@ -1301,42 +1301,117 @@ fn measure_viewport_size(config: &AppConfig, snap: &SystemSnapshot) -> [f32; 2] 
         piped_mode: false,
     };
 
-    let probe_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(680.0, 1200.0));
-    let mut content_rect = egui::Rect::NOTHING;
-
-    let raw_input = egui::RawInput {
-        screen_rect: Some(probe_rect),
-        ..Default::default()
+    let scale = config.font_size / 13.0;
+    let mono_boost = if config.font_choice == FontChoice::Mono {
+        1.15
+    } else {
+        1.0
     };
+    let cols: usize = if snap.cpu_cores_mhz.is_empty() { 4 } else { 3 };
+    let cell_w = if snap.cpu_cores_mhz.is_empty() {
+        92.0 * scale * mono_boost
+    } else {
+        136.0 * scale * mono_boost
+    };
+    let grid_w = if config.show_per_core && !snap.cpu_cores_pct.is_empty() {
+        (cell_w * cols as f32) + (6.0 * (cols.saturating_sub(1) as f32))
+    } else {
+        0.0
+    };
+    let target_bar_w = (440.0 * scale * mono_boost).max(grid_w);
 
-    let _ = ctx.run(raw_input, |ctx| {
-        let panel_resp = egui::CentralPanel::default().show(ctx, |ui| {
-            let bar_w = (ui.available_width() - 24.0).max(200.0);
-            let inner = ui.vertical(|ui| {
+    let mut top_bar_width: f32 = 0.0;
+    let mut content_height: f32 = 0.0;
+
+    let _ = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(2400.0, 2400.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            let _ = egui::CentralPanel::default().show(ctx, |ui| {
+                let start_y = ui.min_rect().top();
+                let top_resp = ui.horizontal(|ui| {
+                    ui.heading(RichText::new("KDE Monitor").strong());
+
+                    if snap.sys_power_w > 0.0 || snap.battery_pct.is_some() {
+                        let badge = match (snap.sys_power_w > 0.0, snap.battery_pct) {
+                            (true, Some(b)) if snap.sys_power_is_battery => {
+                                format!("{:.1}W ({b}%)", snap.sys_power_w)
+                            }
+                            (true, Some(b)) => format!("{:.1}W (AC {b}%)", snap.sys_power_w),
+                            (true, None) => format!("{:.1}W", snap.sys_power_w),
+                            (false, Some(b)) => format!("AC {b}%"),
+                            (false, None) => String::new(),
+                        };
+                        if !badge.is_empty() {
+                            ui.label(
+                                RichText::new(badge)
+                                    .color(Color32::from_rgb(255, 183, 77))
+                                    .strong(),
+                            );
+                        }
+                    }
+
+                    ui.separator();
+
+                    egui::ComboBox::from_id_salt("font_family_combo_probe")
+                        .selected_text(sim_cfg.font_choice.label())
+                        .width(56.0 * (sim_cfg.font_size / 13.0))
+                        .show_ui(ui, |_| {});
+
+                    let _ = ui.small_button("-");
+                    ui.label(format!("{:.0}pt", sim_cfg.font_size));
+                    let _ = ui.small_button("+");
+
+                    ui.separator();
+
+                    egui::ComboBox::from_id_salt("poll_rate_combo_probe")
+                        .selected_text(format!("{:.1}s", sim_interval as f32 / 1000.0))
+                        .width(52.0 * (sim_cfg.font_size / 13.0))
+                        .show_ui(ui, |_| {});
+
+                    let _ = ui.checkbox(&mut sim_cfg.always_on_top, "Pin");
+                    let _ = ui.small_button("Fit");
+                    let _ = ui.button("Hide");
+                });
+                top_bar_width = top_resp.response.rect.width();
+
+                let mut child_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(egui::Rect::from_min_size(
+                            ui.cursor().min,
+                            Vec2::new(target_bar_w + 48.0, 2400.0),
+                        ))
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
                 let _ = render_monitor_contents(
-                    ui,
+                    &mut child_ui,
                     ctx,
                     snap,
                     &mut sim_cfg,
                     &mut sim_interval,
                     &sim_state,
                     &mut sim_dirty,
-                    bar_w,
+                    target_bar_w,
                 );
+                content_height = (child_ui.min_rect().bottom() - start_y).max(0.0);
             });
-            content_rect = inner.response.rect;
-        });
-        let _ = panel_resp;
-    });
+        },
+    );
 
     let panel_frame = egui::Frame::central_panel(&ctx.style());
-    let w = (content_rect.width() + panel_frame.inner_margin.left + panel_frame.inner_margin.right)
-        .max(260.0)
-        .ceil();
-    let h =
-        (content_rect.height() + panel_frame.inner_margin.top + panel_frame.inner_margin.bottom)
-            .max(140.0)
-            .ceil();
+    let ppp = ctx.pixels_per_point().max(1.0);
+    let card_w = target_bar_w + 24.0;
+    let raw_w =
+        top_bar_width.max(card_w) + panel_frame.inner_margin.left + panel_frame.inner_margin.right;
+    let raw_h = content_height + panel_frame.inner_margin.top + panel_frame.inner_margin.bottom;
+
+    let w = ((raw_w.max(260.0)) * ppp).ceil() / ppp;
+    let h = ((raw_h.max(140.0)) * ppp).ceil() / ppp;
 
     [w, h]
 }
@@ -1465,10 +1540,10 @@ impl eframe::App for MonitorWindowApp {
         let mut fit_target = None;
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let bar_w = (ui.available_width() - 24.0).max(200.0);
+            let bar_w = (ui.available_width() - 16.0).max(200.0);
 
             egui::ScrollArea::both()
-                .auto_shrink([false, false])
+                .auto_shrink([true, true])
                 .show(ui, |ui| {
                     fit_target = render_monitor_contents(
                         ui,
