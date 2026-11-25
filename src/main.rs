@@ -1192,13 +1192,16 @@ fn render_monitor_contents(
                         .color(Color32::from_rgb(129, 199, 132)),
                 );
             });
-            ui.label(format!(
-                "Data: {} -> Compr: {} | RAM: {} / {}",
-                format_bytes(z.data_bytes),
-                format_bytes(z.compr_bytes),
-                format_bytes(z.total_ram_bytes),
-                format_bytes(z.disksize_bytes),
-            ));
+            ui.add(
+                egui::Label::new(format!(
+                    "Data: {} -> Compr: {} | RAM: {} / {}",
+                    format_bytes(z.data_bytes),
+                    format_bytes(z.compr_bytes),
+                    format_bytes(z.total_ram_bytes),
+                    format_bytes(z.disksize_bytes),
+                ))
+                .wrap_mode(egui::TextWrapMode::Extend),
+            );
         }
     });
 
@@ -1276,7 +1279,12 @@ fn render_monitor_contents(
                 } else {
                     "Unified Memory (Shared System RAM)".to_string()
                 };
-                ui.label(RichText::new(unified_text).color(Color32::from_rgb(180, 185, 195)));
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(unified_text).color(Color32::from_rgb(180, 185, 195)),
+                    )
+                    .wrap_mode(egui::TextWrapMode::Extend),
+                );
             }
         });
     }
@@ -1284,15 +1292,15 @@ fn render_monitor_contents(
     fit_target
 }
 
+/// Horizontal space `ui.group` consumes around its content (inner margin + stroke).
+const GROUP_OVERHEAD: f32 = 14.0;
+
 fn measure_viewport_size(config: &AppConfig, snap: &SystemSnapshot) -> [f32; 2] {
     let ctx = egui::Context::default();
     ctx.set_visuals(egui::Visuals::dark());
     setup_system_fonts(&ctx);
     apply_font_style(&ctx, config.font_choice, config.font_size);
 
-    let mut sim_cfg = config.clone();
-    let mut sim_interval = config.interval_ms;
-    let mut sim_dirty = false;
     let sim_state = GuiWorkerState {
         snapshot: Mutex::new(snap.clone()),
         interval_ms: AtomicU64::new(config.interval_ms),
@@ -1320,71 +1328,37 @@ fn measure_viewport_size(config: &AppConfig, snap: &SystemSnapshot) -> [f32; 2] 
     };
     let target_bar_w = (440.0 * scale * mono_boost).max(grid_w);
 
-    let mut top_bar_width: f32 = 0.0;
-    let mut content_height: f32 = 0.0;
+    let raw_input = || egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            Vec2::new(2400.0, 2400.0),
+        )),
+        ..Default::default()
+    };
 
-    let _ = ctx.run(
-        egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                Vec2::new(2400.0, 2400.0),
-            )),
-            ..Default::default()
-        },
-        |ctx| {
+    // Fonts installed via `set_fonts` only take effect at the start of the next
+    // pass, so run one empty pass first; otherwise the first measurement uses
+    // default font metrics and the result is wrong.
+    let _ = ctx.run(raw_input(), |_| {});
+
+    // Several passes so state that egui carries over from the previous frame
+    // (Grid column/row sizes, ComboBox, etc.) has settled before we read sizes.
+    let mut measured = Vec2::ZERO;
+    for _ in 0..3 {
+        let _ = ctx.run(raw_input(), |ctx| {
             let _ = egui::CentralPanel::default().show(ctx, |ui| {
-                let start_y = ui.min_rect().top();
-                let top_resp = ui.horizontal(|ui| {
-                    ui.heading(RichText::new("KDE Monitor").strong());
+                let mut sim_cfg = config.clone();
+                let mut sim_interval = config.interval_ms;
+                let mut sim_dirty = false;
 
-                    if snap.sys_power_w > 0.0 || snap.battery_pct.is_some() {
-                        let badge = match (snap.sys_power_w > 0.0, snap.battery_pct) {
-                            (true, Some(b)) if snap.sys_power_is_battery => {
-                                format!("{:.1}W ({b}%)", snap.sys_power_w)
-                            }
-                            (true, Some(b)) => format!("{:.1}W (AC {b}%)", snap.sys_power_w),
-                            (true, None) => format!("{:.1}W", snap.sys_power_w),
-                            (false, Some(b)) => format!("AC {b}%"),
-                            (false, None) => String::new(),
-                        };
-                        if !badge.is_empty() {
-                            ui.label(
-                                RichText::new(badge)
-                                    .color(Color32::from_rgb(255, 183, 77))
-                                    .strong(),
-                            );
-                        }
-                    }
-
-                    ui.separator();
-
-                    egui::ComboBox::from_id_salt("font_family_combo_probe")
-                        .selected_text(sim_cfg.font_choice.label())
-                        .width(56.0 * (sim_cfg.font_size / 13.0))
-                        .show_ui(ui, |_| {});
-
-                    let _ = ui.small_button("-");
-                    ui.label(format!("{:.0}pt", sim_cfg.font_size));
-                    let _ = ui.small_button("+");
-
-                    ui.separator();
-
-                    egui::ComboBox::from_id_salt("poll_rate_combo_probe")
-                        .selected_text(format!("{:.1}s", sim_interval as f32 / 1000.0))
-                        .width(52.0 * (sim_cfg.font_size / 13.0))
-                        .show_ui(ui, |_| {});
-
-                    let _ = ui.checkbox(&mut sim_cfg.always_on_top, "Pin");
-                    let _ = ui.small_button("Fit");
-                    let _ = ui.button("Hide");
-                });
-                top_bar_width = top_resp.response.rect.width();
-
+                // Bound the width so full-width widgets (separators, groups) don't
+                // stretch to the 2400px sim screen. Wider items (top bar) overflow
+                // and are still captured by `min_rect`.
                 let mut child_ui = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(egui::Rect::from_min_size(
                             ui.cursor().min,
-                            Vec2::new(target_bar_w + 48.0, 2400.0),
+                            Vec2::new(target_bar_w + GROUP_OVERHEAD, 2400.0),
                         ))
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                 );
@@ -1398,22 +1372,16 @@ fn measure_viewport_size(config: &AppConfig, snap: &SystemSnapshot) -> [f32; 2] 
                     &mut sim_dirty,
                     target_bar_w,
                 );
-                content_height = (child_ui.min_rect().bottom() - start_y).max(0.0);
+                measured = child_ui.min_rect().size();
             });
-        },
-    );
+        });
+    }
 
     let panel_frame = egui::Frame::central_panel(&ctx.style());
-    let ppp = ctx.pixels_per_point().max(1.0);
-    let card_w = target_bar_w + 24.0;
-    let raw_w =
-        top_bar_width.max(card_w) + panel_frame.inner_margin.left + panel_frame.inner_margin.right;
-    let raw_h = content_height + panel_frame.inner_margin.top + panel_frame.inner_margin.bottom;
+    let raw_w = measured.x + panel_frame.inner_margin.left + panel_frame.inner_margin.right + 2.0;
+    let raw_h = measured.y + panel_frame.inner_margin.top + panel_frame.inner_margin.bottom;
 
-    let w = ((raw_w.max(260.0)) * ppp).ceil() / ppp;
-    let h = ((raw_h.max(140.0)) * ppp).ceil() / ppp;
-
-    [w, h]
+    [raw_w.max(260.0).ceil(), raw_h.max(140.0).ceil()]
 }
 
 fn setup_system_fonts(ctx: &egui::Context) {
@@ -1540,7 +1508,7 @@ impl eframe::App for MonitorWindowApp {
         let mut fit_target = None;
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let bar_w = (ui.available_width() - 16.0).max(200.0);
+            let bar_w = (ui.available_width() - GROUP_OVERHEAD).max(200.0);
 
             egui::ScrollArea::both()
                 .auto_shrink([true, true])
