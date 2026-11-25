@@ -5,7 +5,7 @@ mod collector;
 use collector::{GpuMetrics, HardwareCollector, MemoryMetrics, SystemSnapshot, ZramMetrics};
 use eframe::egui::{
     self, Color32, FontData, FontDefinitions, FontFamily, FontId, ProgressBar, RichText, TextStyle,
-    Vec2, ViewportBuilder, ViewportCommand, WindowLevel,
+    Vec2, ViewportBuilder, ViewportCommand,
 };
 use ksni::{
     Icon, MenuItem, ToolTip, Tray, TrayService,
@@ -323,7 +323,6 @@ struct AppConfig {
     font_choice: FontChoice,
     font_size: f32,
     interval_ms: u64,
-    always_on_top: bool,
     show_per_core: bool,
 }
 
@@ -333,7 +332,6 @@ impl Default for AppConfig {
             font_choice: FontChoice::Sans,
             font_size: 13.0,
             interval_ms: 1000,
-            always_on_top: false,
             show_per_core: false,
         }
     }
@@ -374,7 +372,6 @@ impl AppConfig {
                             }
                         }
                     }
-                    "always_on_top" => cfg.always_on_top = v.trim() == "true",
                     "show_per_core" => cfg.show_per_core = v.trim() == "true",
                     _ => {}
                 }
@@ -389,11 +386,10 @@ impl AppConfig {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "font_family={}\nfont_size={:.1}\ninterval_ms={}\nalways_on_top={}\nshow_per_core={}\n",
+            "font_family={}\nfont_size={:.1}\ninterval_ms={}\nshow_per_core={}\n",
             self.font_choice.as_key(),
             self.font_size,
             self.interval_ms,
-            self.always_on_top,
             self.show_per_core
         );
         let _ = fs::write(path, body);
@@ -923,11 +919,6 @@ impl MonitorWindowApp {
         setup_system_fonts(&cc.egui_ctx);
         apply_font_style(&cc.egui_ctx, config.font_choice, config.font_size);
 
-        if config.always_on_top {
-            cc.egui_ctx
-                .send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop));
-        }
-
         if let Ok(mut guard) = state.egui_ctx.lock() {
             *guard = Some(cc.egui_ctx.clone());
         }
@@ -1043,16 +1034,6 @@ fn render_monitor_contents(
                     }
                 }
             });
-
-        if ui.checkbox(&mut config.always_on_top, "Pin").changed() {
-            let level = if config.always_on_top {
-                WindowLevel::AlwaysOnTop
-            } else {
-                WindowLevel::Normal
-            };
-            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(level));
-            *config_dirty = true;
-        }
 
         if ui
             .small_button("Fit")
@@ -1306,13 +1287,9 @@ fn measure_viewport_size(config: &AppConfig, snap: &SystemSnapshot) -> [f32; 2] 
     setup_system_fonts(&ctx);
     apply_font_style(&ctx, config.font_choice, config.font_size);
 
-    let sim_state = GuiWorkerState {
-        snapshot: Mutex::new(snap.clone()),
-        interval_ms: AtomicU64::new(config.interval_ms),
-        show_per_core: AtomicBool::new(config.show_per_core),
-        egui_ctx: Mutex::new(None),
-        piped_mode: false,
-    };
+    let panel_frame = egui::Frame::central_panel(&ctx.style());
+    let margins_x = panel_frame.inner_margin.left + panel_frame.inner_margin.right;
+    let margins_y = panel_frame.inner_margin.top + panel_frame.inner_margin.bottom;
 
     let scale = config.font_size / 13.0;
     let mono_boost = if config.font_choice == FontChoice::Mono {
@@ -1320,8 +1297,8 @@ fn measure_viewport_size(config: &AppConfig, snap: &SystemSnapshot) -> [f32; 2] 
     } else {
         1.0
     };
-    let cols: usize = if config.show_per_core { 3 } else { 4 };
-    let cell_w = if !config.show_per_core {
+    let cols: usize = if snap.cpu_cores_mhz.is_empty() { 4 } else { 3 };
+    let cell_w = if snap.cpu_cores_mhz.is_empty() {
         92.0 * scale * mono_boost
     } else {
         136.0 * scale * mono_boost
@@ -1332,61 +1309,123 @@ fn measure_viewport_size(config: &AppConfig, snap: &SystemSnapshot) -> [f32; 2] 
         0.0
     };
     let target_bar_w = (440.0 * scale * mono_boost).max(grid_w);
+    let card_w = target_bar_w + 24.0;
 
-    let raw_input = || egui::RawInput {
-        screen_rect: Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            Vec2::new(2400.0, 2400.0),
-        )),
-        ..Default::default()
+    let sim_state = GuiWorkerState {
+        snapshot: Mutex::new(snap.clone()),
+        interval_ms: AtomicU64::new(config.interval_ms),
+        show_per_core: AtomicBool::new(config.show_per_core),
+        egui_ctx: Mutex::new(None),
+        piped_mode: false,
     };
 
-    // Fonts installed via `set_fonts` only take effect at the start of the next
-    // pass, so run one empty pass first; otherwise the first measurement uses
-    // default font metrics and the result is wrong.
-    let _ = ctx.run(raw_input(), |_| {});
+    let big = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(4000.0, 4000.0));
 
-    // Several passes so state that egui carries over from the previous frame
-    // (Grid column/row sizes, ComboBox, etc.) has settled before we read sizes.
-    let mut measured = Vec2::ZERO;
-    for _ in 0..3 {
-        let _ = ctx.run(raw_input(), |ctx| {
+    // ---- Pass 1: natural width of the top control bar ----
+    let mut top_bar_width: f32 = 0.0;
+    let _ = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(big),
+            ..Default::default()
+        },
+        |ctx| {
             let _ = egui::CentralPanel::default().show(ctx, |ui| {
-                let mut sim_cfg = config.clone();
-                let mut sim_interval = config.interval_ms;
-                let mut sim_dirty = false;
+                let sim_cfg = config.clone();
+                let sim_interval = config.interval_ms;
+                let resp = ui.horizontal(|ui| {
+                    ui.heading(RichText::new("KDE Monitor").strong());
 
-                // Bound the width so full-width widgets (separators, groups) don't
-                // stretch to the 2400px sim screen. Wider items (top bar) overflow
-                // and are still captured by `min_rect`.
-                let mut child_ui = ui.new_child(
+                    if snap.sys_power_w > 0.0 || snap.battery_pct.is_some() {
+                        let badge = match (snap.sys_power_w > 0.0, snap.battery_pct) {
+                            (true, Some(b)) if snap.sys_power_is_battery => {
+                                format!("{:.1}W ({b}%)", snap.sys_power_w)
+                            }
+                            (true, Some(b)) => format!("{:.1}W (AC {b}%)", snap.sys_power_w),
+                            (true, None) => format!("{:.1}W", snap.sys_power_w),
+                            (false, Some(b)) => format!("AC {b}%"),
+                            (false, None) => String::new(),
+                        };
+                        if !badge.is_empty() {
+                            ui.label(
+                                RichText::new(badge)
+                                    .color(Color32::from_rgb(255, 183, 77))
+                                    .strong(),
+                            );
+                        }
+                    }
+
+                    ui.separator();
+
+                    egui::ComboBox::from_id_salt("font_family_combo_probe")
+                        .selected_text(sim_cfg.font_choice.label())
+                        .width(56.0 * (sim_cfg.font_size / 13.0))
+                        .show_ui(ui, |_| {});
+
+                    let _ = ui.small_button("-");
+                    ui.label(format!("{:.0}pt", sim_cfg.font_size));
+                    let _ = ui.small_button("+");
+
+                    ui.separator();
+
+                    egui::ComboBox::from_id_salt("poll_rate_combo_probe")
+                        .selected_text(format!("{:.1}s", sim_interval as f32 / 1000.0))
+                        .width(52.0 * (sim_cfg.font_size / 13.0))
+                        .show_ui(ui, |_| {});
+
+                    let _ = ui.small_button("Fit");
+                    let _ = ui.button("Hide");
+                });
+                top_bar_width = resp.response.rect.width();
+            });
+        },
+    );
+
+    // Width the body will actually have inside the window. This must match the
+    // live `update()`, where the body fills the central-panel content width and
+    // bar_w = available_width - 16.
+    let content_width = top_bar_width.max(card_w);
+    let bar_w = (content_width - 16.0).max(200.0);
+
+    // ---- Pass 2: full height at the real content width (top bar rendered once, inside) ----
+    let mut content_height: f32 = 0.0;
+    let _ = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(big),
+            ..Default::default()
+        },
+        |ctx| {
+            let _ = egui::CentralPanel::default().show(ctx, |ui| {
+                let start_y = ui.min_rect().top();
+                let mut child = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(egui::Rect::from_min_size(
                             ui.cursor().min,
-                            Vec2::new(target_bar_w + GROUP_OVERHEAD, 2400.0),
+                            Vec2::new(content_width, 4000.0),
                         ))
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                 );
+                let mut sim_cfg = config.clone();
+                let mut sim_interval = config.interval_ms;
+                let mut sim_dirty = false;
                 let _ = render_monitor_contents(
-                    &mut child_ui,
+                    &mut child,
                     ctx,
                     snap,
                     &mut sim_cfg,
                     &mut sim_interval,
                     &sim_state,
                     &mut sim_dirty,
-                    target_bar_w,
+                    bar_w,
                 );
-                measured = child_ui.min_rect().size();
+                content_height = (child.min_rect().bottom() - start_y).max(0.0);
             });
-        });
-    }
+        },
+    );
 
-    let panel_frame = egui::Frame::central_panel(&ctx.style());
-    let raw_w = measured.x + panel_frame.inner_margin.left + panel_frame.inner_margin.right + 2.0;
-    let raw_h = measured.y + panel_frame.inner_margin.top + panel_frame.inner_margin.bottom;
-
-    [raw_w.max(260.0).ceil(), raw_h.max(140.0).ceil()]
+    let ppp = ctx.pixels_per_point().max(1.0);
+    let w = (((content_width + margins_x).max(260.0)) * ppp).ceil() / ppp;
+    let h = (((content_height + margins_y).max(140.0)) * ppp).ceil() / ppp;
+    [w, h]
 }
 
 fn setup_system_fonts(ctx: &egui::Context) {
